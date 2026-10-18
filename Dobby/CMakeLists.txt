@@ -34,6 +34,7 @@ option(Plugin.Android.BionicLinkerUtil "Enable android bionic linker util" OFF)
 option(DOBBY_BUILD_EXAMPLE "Build example" OFF)
 
 option(DOBBY_BUILD_TEST "Build test" OFF)
+option(DOBBY_WITH_JNI "Enable C++ JNI argument inspection for native hooks" OFF)
 option(DOBBY_WITH_WXSHADOW "Enable the strict Android ARM64 wxshadow backend" OFF)
 option(DOBBY_WXSHADOW_TESTING "Build host transport/failure tests (not for production)" OFF)
 set(DOBBY_WXSHADOW_UAPI_DIR "" CACHE PATH "Directory containing wxshadow_uapi.h and wxshadow_arm64.h")
@@ -190,6 +191,16 @@ if(DOBBY_WITH_WXSHADOW)
     source/Backend/UserMode/WxShadow/WxShadowCodeAllocator.cc)
 endif()
 
+if(DOBBY_WITH_JNI)
+  if(DOBBY_BUILD_KERNEL_MODE)
+    message(FATAL_ERROR "DOBBY_WITH_JNI requires user mode")
+  endif()
+  if(NOT SYSTEM.Android)
+    find_package(JNI REQUIRED)
+  endif()
+  list(APPEND dobby.SOURCE_FILE_LIST source/JniBridge/dobby_jni.cc)
+endif()
+
 
 if (SYSTEM.Darwin AND NOT DOBBY_BUILD_KERNEL_MODE)
   set(dobby.SOURCE_FILE_LIST ${dobby.SOURCE_FILE_LIST}
@@ -332,6 +343,16 @@ add_library(dobby_static STATIC
 target_include_directories(dobby_static PUBLIC
   include
   )
+
+if(DOBBY_WITH_JNI)
+  foreach(jni_target dobby dobby_static)
+    target_compile_definitions(${jni_target} PUBLIC DOBBY_WITH_JNI=1)
+    target_compile_features(${jni_target} PUBLIC cxx_std_17)
+    if(NOT SYSTEM.Android)
+      target_include_directories(${jni_target} PUBLIC ${JNI_INCLUDE_DIRS})
+    endif()
+  endforeach()
+endif()
 
 set_target_properties(dobby_static
   PROPERTIES OUTPUT_NAME "dobby"

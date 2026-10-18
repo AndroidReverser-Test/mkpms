@@ -16,3 +16,8 @@ add_library(socket_example_lib SHARED
 target_link_libraries(socket_example_lib
   dobby
   )
+
+if(DOBBY_WITH_JNI)
+  add_library(jni_example_lib SHARED jni_example.cc)
+  target_link_libraries(jni_example_lib PRIVATE dobby)
+endif()

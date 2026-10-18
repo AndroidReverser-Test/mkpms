@@ -7,3 +7,4 @@ kpms/wxshadow/linux/modules.order
 kpms/wxshadow/linux/Module.symvers
 cmake-build-debug/
 tools/kpatch/kpatch
+/rustFrida/

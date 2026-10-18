@@ -2,6 +2,8 @@
 
 实现说明：[设计与实现](dobby-wxshadow-design.md)。测试证据：[验证记录](dobby-wxshadow-validation.md)。
 
+Native 回调中的 Java 参数读取见 [JNI 解析接入](dobby-jni-usage.md)，可通过 `DOBBY_WITH_JNI=ON` 与本后端一起使用。
+
 ## 1. 工作方式与支持范围
 
 应用链接本仓库的 Dobby，显式选择 `DOBBY_HOOK_BACKEND_WXSHADOW_REQUIRED` 后，继续使用 `DobbyHook` / `DobbyDestroy`。Dobby 创建独立 RX 的 original 和 relay，通过 prctl 将源入口的单条 B 指令提交给 wxshadow。用户读取源页得到原始内容，执行时切换至 shadow。

@@ -17,6 +17,7 @@ REQUIRED 严格失败，不回退普通入口写入。需要启用 `DOBBY_WITH_W
 - [构建、使用、错误恢复与卸载](docs/dobby-wxshadow-usage.md)
 - [设计与源码实现](docs/dobby-wxshadow-design.md)
 - [实际验证范围及结果](docs/dobby-wxshadow-validation.md)
+- [Native hook 的 Java 参数解析：JNI 字符串、数组、对象字段及 ARM64 参数解码](docs/dobby-jni-usage.md)
 
 安装/撤销须由调用方协调停止整个目标页访问。DobbyInstrument、BTI/PAC、JIT 和同页自读不在当前支持范围。卸载顺序：所有客户端撤销 hook → 管理员 `wxshadow_protocol_client quiesce` → `kpatch kpm unload`；框架无法阻止绕过 QUIESCE 的误卸载。
 
