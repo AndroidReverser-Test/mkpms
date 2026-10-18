@@ -7,6 +7,15 @@ if(NOT DEFINED KP_DIR)
     set(KP_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
+# Windows checkouts can materialize the tracked kernel symlink as a text file.
+set(KPM_KERNEL_DIR "${KP_DIR}/kernel" CACHE PATH "KernelPatch kernel headers")
+if(NOT IS_DIRECTORY "${KPM_KERNEL_DIR}" AND IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.kp/kernel")
+    set(KPM_KERNEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.kp/kernel")
+endif()
+if(NOT IS_DIRECTORY "${KPM_KERNEL_DIR}")
+    message(FATAL_ERROR "KernelPatch headers missing: git submodule update --init .kp, or set KPM_KERNEL_DIR")
+endif()
+
 # 默认使用无调试信息的 Release 构建。
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -27,7 +36,7 @@ set(KERNEL_INCLUDE_DIRS
 # 创建全局包含目录列表
 set(GLOBAL_INCLUDE_DIRS "")
 foreach(dir ${KERNEL_INCLUDE_DIRS})
-    list(APPEND GLOBAL_INCLUDE_DIRS "${KP_DIR}/kernel/${dir}")
+    list(APPEND GLOBAL_INCLUDE_DIRS "${KPM_KERNEL_DIR}/${dir}")
 endforeach()
 
 # 定义通用的KPM模块构建函数

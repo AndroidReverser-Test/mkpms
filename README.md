@@ -3,6 +3,23 @@
 
 缺陷：无法对自读代码区域设置断点，同一页无法同时读取和执行
 
+## Dobby 直接接入（Android ARM64）
+
+已增加可选的 WxShadow 后端，继续使用 `DobbyHook` / `DobbyDestroy`：
+
+```cpp
+int rc = dobby_set_hook_backend(DOBBY_HOOK_BACKEND_WXSHADOW_REQUIRED);
+if (rc == 0) rc = DobbyHook(target, replacement, &original);
+```
+
+REQUIRED 严格失败，不回退普通入口写入。需要启用 `DOBBY_WITH_WXSHADOW`，并将按目标 Linux 5.10 完整配置 Kbuild 的 VM 适配对象链接进 KPM。已通过 Android 12 / 5.10.66 设备上的静态库和动态库测试。
+
+- [构建、使用、错误恢复与卸载](docs/dobby-wxshadow-usage.md)
+- [设计与源码实现](docs/dobby-wxshadow-design.md)
+- [实际验证范围及结果](docs/dobby-wxshadow-validation.md)
+
+安装/撤销须由调用方协调停止整个目标页访问。DobbyInstrument、BTI/PAC、JIT 和同页自读不在当前支持范围。卸载顺序：所有客户端撤销 hook → 管理员 `wxshadow_protocol_client quiesce` → `kpatch kpm unload`；框架无法阻止绕过 QUIESCE 的误卸载。
+
 ### 目前通过prctl提供接口给用户态进程调用，支持两种接口bp和patch
 * wxshadow_client实现了基本的wxshadow接口调用，可以用来测试bp断点和patch能力
 * bp接口能够直接对某个地址设置断点，可以用来进行简单的测试无痕效果，设置断点后通过dmesg查看日志

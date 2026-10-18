@@ -1,4 +1,9 @@
 .idea/
 build/
+kpms/wxshadow/linux/*.o
+kpms/wxshadow/linux/.*.cmd
+kpms/wxshadow/linux/*.mod
+kpms/wxshadow/linux/modules.order
+kpms/wxshadow/linux/Module.symvers
 cmake-build-debug/
 tools/kpatch/kpatch

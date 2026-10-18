@@ -34,7 +34,7 @@ static int lookup_callback(void *data, const char *name, struct module *mod, uns
  * This avoids potential hangs when module_kallsyms_lookup_name
  * traverses the kernel module list.
  */
-static unsigned long lookup_name_safe(const char *name)
+unsigned long wxshadow_lookup_symbol(const char *name)
 {
     struct lookup_data ld = { .name = name, .addr = 0 };
 
@@ -43,6 +43,7 @@ static unsigned long lookup_name_safe(const char *name)
     }
     return ld.addr;
 }
+#define lookup_name_safe wxshadow_lookup_symbol
 
 /* ========== Symbol resolution macros ========== */
 

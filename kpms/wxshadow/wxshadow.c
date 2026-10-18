@@ -17,10 +17,10 @@
 #endif
 
 KPM_NAME("wxshadow");
-KPM_VERSION("1.0.0");
+KPM_VERSION("1.1.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("wxshadow");
-KPM_DESCRIPTION("W^X Shadow Memory - Hidden Breakpoint Mechanism");
+KPM_DESCRIPTION("W^X Shadow Memory - Breakpoints and transactional Dobby backend");
 
 /* ========== Global variable definitions ========== */
 
@@ -1544,6 +1544,7 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
     }
 
     /* Debug: print first 10 processes */
+    wx_protocol_init();
     debug_print_tasks_list(10);
 
     return 0;
@@ -1595,6 +1596,10 @@ static long wxshadow_exit(void *__user reserved)
     int page_count = 0;
 
     pr_info("wxshadow: unloading...\n");
+    /* KP ignores a failed exit result and frees this module even under RCU.
+     * The native adapter's notifiers must already be drained by QUIESCE. */
+    if (!wx_linux_is_quiesced())
+        pr_err("wxshadow: UNSAFE UNLOAD: run wxshadow_protocol_client quiesce after destroying all hooks first\n");
 
     /*
      * Phase 1: Unhook prctl to block new user operations.

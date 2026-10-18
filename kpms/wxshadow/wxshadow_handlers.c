@@ -141,6 +141,13 @@ static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
         return;
     }
 
+    if (user_mode((struct pt_regs *)args->arg2) && wx_linux_fault(mm, far, access)) {
+        args->ret = 0;
+        args->skip_origin = true;
+        kfunc_mmput(mm);
+        return;
+    }
+
     /* Check if this is a wxshadow page at this address */
     page = wxshadow_find_page(mm, far);
     if (!page) {
@@ -218,6 +225,9 @@ static void follow_page_pte_before_impl(hook_fargs5_t *args, void *udata)
     u64 orig_pte;
 
     args->arg5 = 0;  /* default: no restore needed */
+    /* Native transactions retire before slow GUP observes the PTE. This is a
+     * safety path, not a claim of persistent GUP hiding (WX_CAP_GUP stays off). */
+    wx_linux_before_gup(vma, address);
 
     /* Fast path: no shadow pages at all */
     if (list_empty(&page_list))
@@ -557,12 +567,14 @@ void before_dup_mmap_wx(hook_fargs2_t *args, void *udata)
 
     WX_HANDLER_ENTER();
     args->local.data0 = 0;
+    args->local.data1 = 0;
     if (!oldmm) {
         WX_HANDLER_EXIT();
         return;
     }
 
     args->local.data0 = 1;
+    args->local.data1 = wx_linux_before_fork(oldmm);
     wxshadow_pause_parent_shadow_pages(oldmm);
     WX_HANDLER_EXIT();
 }
@@ -580,6 +592,7 @@ void after_dup_mmap_wx(hook_fargs2_t *args, void *udata)
     }
 
     wxshadow_resume_parent_shadow_pages(oldmm);
+    if (args->local.data1) wx_linux_after_fork();
     WX_HANDLER_EXIT();
 }
 

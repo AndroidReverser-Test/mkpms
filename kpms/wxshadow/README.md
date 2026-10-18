@@ -4,6 +4,15 @@ W^X Shadow Memory — 基于 KernelPatch 的用户态代码隐藏断点/Patch �
 
 通过 shadow page 技术在用户进程代码段设置隐藏断点或自定义 patch：进程读取时看到原始代码，执行时触发修改后的指令。
 
+## Dobby 增强协议
+
+版本 1.1.0 增加 Dobby 的事务入口后端、能力查询、cookie 和安全撤销。
+使用与目标 Linux 5.10 完整源码/配置匹配的 Kbuild VM 适配对象。
+
+参见 [Dobby 构建和使用](../../docs/dobby-wxshadow-usage.md)、[设计](../../docs/dobby-wxshadow-design.md) 和 [验证记录](../../docs/dobby-wxshadow-validation.md)。
+
+增强路径卸载必须先撤销全部 hook，再由管理员执行 `wxshadow_protocol_client quiesce`，成功后才能卸载 KPM。
+
 ## 原理
 
 - **Shadow 页**: 复制原始代码页，在断点处写入 BRK 指令（或自定义 patch），设置 `--x` 权限
@@ -121,6 +130,6 @@ kpatch <superkey> kpm unload wxshadow
 | `single_step_handler` | direct hook | 单步执行处理 |
 | `do_page_fault` | hook (可选) | 读取隐藏 |
 | `follow_page_pte` | hook (可选) | GUP 隐藏 |
-| `copy_process` | hook | fork 保护 |
+| `dup_mmap` / `uprobe_dup_mmap` | hook | fork 保护，后者为旧路径备用 |
 | `exit_mmap` | hook | 进程退出清理 |
 

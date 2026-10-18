@@ -1232,6 +1232,14 @@ static void *resolve_pid_to_mm(pid_t pid)
             kfunc_rcu_read_unlock();
             return NULL;
         }
+        if (task != current) {
+            bool (*may_access)(void *, unsigned int) =
+                (void *)wxshadow_lookup_symbol("ptrace_may_access");
+            if (!may_access || !may_access(task, 0x02 | 0x10)) {
+                kfunc_rcu_read_unlock();
+                return NULL;
+            }
+        }
         mm = kfunc_get_task_mm(task);
     }
     kfunc_rcu_read_unlock();
@@ -1248,12 +1256,32 @@ void prctl_before(hook_fargs4_t *args, void *udata)
     void *mm;
     int ret;
     pid_t pid;
+    int legacy_locked;
+#ifdef WXSHADOW_DEBUG_PROTOCOL
+    if (option >= PR_WXSHADOW_QUERY && option <= PR_WXSHADOW_QUIESCE) {
+        pr_info("wxshadow: prctl trace option=%x wrapper=%d arg2=%lx\n", option, has_syscall_wrapper, arg2);
+    }
+#endif
 
     /* Only track wxshadow prctl calls for in-flight counting */
-    if (option < PR_WXSHADOW_SET_BP || option > PR_WXSHADOW_RELEASE)
+    switch (option) {
+    case PR_WXSHADOW_QUERY: case PR_WXSHADOW_PATCH_EX:
+    case PR_WXSHADOW_RELEASE_EX: case PR_WXSHADOW_QUERY_PATCH:
+    case PR_WXSHADOW_QUIESCE:
+        WX_HANDLER_ENTER();
+        args->ret = wx_protocol_request(option, arg2, arg3, arg4, arg5);
+        args->skip_origin = 1;
+        WX_HANDLER_EXIT();
         return;
+    case PR_WXSHADOW_SET_BP: case PR_WXSHADOW_SET_REG: case PR_WXSHADOW_DEL_BP:
+    case PR_WXSHADOW_SET_TLB_MODE: case PR_WXSHADOW_GET_TLB_MODE:
+    case PR_WXSHADOW_PATCH: case PR_WXSHADOW_RELEASE:
+        break;
+    default: return;
+    }
 
     WX_HANDLER_ENTER();
+    legacy_locked = wx_linux_legacy_lock();
 
     /* Lazy scan mm->context.id offset on first wxshadow prctl call */
     if (mm_context_id_offset < 0)
@@ -1264,7 +1292,7 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         pid = (pid_t)arg2;
         mm = resolve_pid_to_mm(pid);
         if (!mm) { args->ret = -3; args->skip_origin = 1; break; }
-        ret = wxshadow_do_set_bp(mm, arg3);
+        ret = wx_protocol_legacy_conflict(mm, arg3) ? -EBUSY : wxshadow_do_set_bp(mm, arg3);
         kfunc_mmput(mm);
         args->ret = ret;
         args->skip_origin = 1;
@@ -1274,7 +1302,7 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         pid = (pid_t)arg2;
         mm = resolve_pid_to_mm(pid);
         if (!mm) { args->ret = -3; args->skip_origin = 1; break; }
-        ret = wxshadow_do_set_reg(mm, arg3, (unsigned int)arg4, arg5);
+        ret = wx_protocol_legacy_conflict(mm, arg3) ? -EBUSY : wxshadow_do_set_reg(mm, arg3, (unsigned int)arg4, arg5);
         kfunc_mmput(mm);
         args->ret = ret;
         args->skip_origin = 1;
@@ -1284,7 +1312,8 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         pid = (pid_t)arg2;
         mm = resolve_pid_to_mm(pid);
         if (!mm) { args->ret = -3; args->skip_origin = 1; break; }
-        if (arg3 == 0) {
+        if (wx_protocol_legacy_conflict(mm, arg3)) ret = -EBUSY;
+        else if (arg3 == 0) {
             ret = wxshadow_release_pages_for_mm(mm, "del_all_bp");
         } else {
             ret = wxshadow_do_del_bp(mm, arg3);
@@ -1295,6 +1324,12 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         break;
 
     case PR_WXSHADOW_SET_TLB_MODE:
+        {
+        bool (*capable_fn)(int) = (void *)wxshadow_lookup_symbol("capable");
+        if (!capable_fn || !capable_fn(21)) {
+            args->ret = -EPERM; args->skip_origin = 1; break;
+        }
+        }
         if (arg2 > WX_TLB_MODE_FULL) {
             pr_err("wxshadow: [prctl] invalid TLB mode: %lu\n", arg2);
             args->ret = -22;
@@ -1317,7 +1352,7 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         pid = (pid_t)arg2;
         mm = resolve_pid_to_mm(pid);
         if (!mm) { args->ret = -3; args->skip_origin = 1; break; }
-        ret = wxshadow_do_patch(mm, arg3, (void __user *)arg4, arg5);
+        ret = wx_protocol_legacy_conflict(mm, arg3) ? -EBUSY : wxshadow_do_patch(mm, arg3, (void __user *)arg4, arg5);
         kfunc_mmput(mm);
         args->ret = ret;
         args->skip_origin = 1;
@@ -1327,7 +1362,8 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         pid = (pid_t)arg2;
         mm = resolve_pid_to_mm(pid);
         if (!mm) { args->ret = -3; args->skip_origin = 1; break; }
-        if (arg3 == 0) {
+        if (wx_protocol_legacy_conflict(mm, arg3)) ret = -EBUSY;
+        else if (arg3 == 0) {
             ret = wxshadow_release_pages_for_mm(mm, "release_all");
         } else {
             ret = wxshadow_do_release(mm, arg3);
@@ -1341,5 +1377,6 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         break;
     }
 
+    if (legacy_locked) wx_linux_legacy_unlock();
     WX_HANDLER_EXIT();
 }

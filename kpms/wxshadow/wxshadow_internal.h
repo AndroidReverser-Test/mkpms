@@ -28,6 +28,7 @@
 
 #include <predata.h>
 #include "wxshadow.h"
+#include "wxshadow_linux.h"
 
 /* ========== ARM64 CPU helpers ========== */
 
