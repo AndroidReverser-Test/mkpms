@@ -3,6 +3,16 @@
 
 缺陷：无法对自读代码区域设置断点，同一页无法同时读取和执行
 
+## Linux uprobe / Kernel-Trace 接入
+
+新增独立模块 **wxuprobe.kpm**：结合本项目的读执行分离与 Kernel-Trace 使用的 Linux uprobe，在函数原指令执行前修改 **x0–x30 和 SP**，由内核继续完成指令模拟、XOL 和单步。支持原 Kernel-Trace ARM64 mincore 接口，以及新增的寄存器更新、单独删除和 prctl 管理接口；运行时解密代码直接使用内存原指令。
+
+- [构建、接入、兼容接口与卸载](kpms/wxuprobe/README.md)
+- [两个项目的实现梳理、集成设计与实机验证](docs/kernel-trace-wxuprobe.md)
+- [可重复执行的设备测试脚本](tests/wxuprobe/run-device-tests.ps1)
+
+已在当前 Android 12 / ARM64 / Linux 5.10.66 / 4KB 页设备验证 2000 个同时活动 hook、全部通用寄存器和 SP、整页读取校验、生命周期及完整卸载。需要匹配目标内核完整配置的 Kbuild 对象。不要同时加载原 kernel_trace；卸载前必须先通过客户端 QUIESCE，详见模块文档。
+
 ## Dobby 直接接入（Android ARM64）
 
 已增加可选的 WxShadow 后端，继续使用 `DobbyHook` / `DobbyDestroy`：

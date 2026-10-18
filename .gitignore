@@ -5,6 +5,12 @@ kpms/wxshadow/linux/.*.cmd
 kpms/wxshadow/linux/*.mod
 kpms/wxshadow/linux/modules.order
 kpms/wxshadow/linux/Module.symvers
+kpms/wxuprobe/linux/*.o
+kpms/wxuprobe/linux/.*.cmd
+kpms/wxuprobe/linux/*.mod
+kpms/wxuprobe/linux/modules.order
+kpms/wxuprobe/linux/Module.symvers
 cmake-build-debug/
 tools/kpatch/kpatch
 /rustFrida/
+/Kernel-Trace/
