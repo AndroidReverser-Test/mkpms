@@ -56,3 +56,4 @@ target_compile_definitions(wxshadow_protocol_test PRIVATE WXSHADOW_PROTOCOL_TEST
 target_compile_options(wxshadow_protocol_test PRIVATE -UNDEBUG)
 target_include_directories(wxshadow_protocol_test PRIVATE ../shared wxshadow)
 add_test(NAME wxshadow_protocol COMMAND wxshadow_protocol_test)
+add_subdirectory(compat)

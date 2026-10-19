@@ -1,5 +1,7 @@
 # Dobby native hook 的 Java 参数解析
 
+2026-10-19 补充：相同用户态库已在 Pixel 6 / Android 16 / Linux 6.1.134 配合 portable KPM 通过静态/动态 × native/WxShadow 四组 ART JNI 回归。目标内核自动适配见[跨内核兼容说明](kernel-compatibility.md)。
+
 日期：2026-10-18。已通过主机 OpenJDK 和 Android 12 / ARM64 实机测试。
 
 ## 1. 框架关系与接入位置

@@ -1,5 +1,5 @@
 set(WXUPROBE_LINUX_ADAPTER_OBJECT "" CACHE FILEPATH
-    "wxuprobe_linux.o built with the exact target Linux 5.10 Kbuild")
+    "wxuprobe_linux.o built with Linux 5.10-6.6 Kbuild (BTF target auto-adaptation)")
 if(WXUPROBE_LINUX_ADAPTER_OBJECT)
     if(NOT EXISTS "${WXUPROBE_LINUX_ADAPTER_OBJECT}")
         message(FATAL_ERROR "WXUPROBE_LINUX_ADAPTER_OBJECT does not exist")

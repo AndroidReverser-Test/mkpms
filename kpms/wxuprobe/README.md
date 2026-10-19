@@ -8,10 +8,14 @@
 
 ## 支持范围
 
-本次实际验证：Android 12 / ARM64 / 4KB 页，内核
-`5.10.66-android12-9-00001-gd262b276948e-ab8291727`。
+当前版本实际验证：Pixel 6 / Android 16 / ARM64 / 4KB 页，内核
+`6.1.134-android14-11-g66e758f7d0c0-ab13748739`，使用 5.10 基准对象构建；完整脚本、tracefs 及安全卸载均通过。[跨内核兼容与验证](../../docs/kernel-compatibility.md)。旧版 Android 12 / 5.10.66 的记录保留在原验证文档。
 
-适配对象须用目标 **Linux 5.10 的准确源码和完整配置**编译，要求 `CONFIG_UPROBES`、`CONFIG_MMU_NOTIFIER`、4KB 页，无 PREEMPT_RT、无随机结构布局，VA/PA 不超过 48 位。模块会检查 release 和 `mm.pgd` 偏移；这两个检查不能替代完整配置匹配。5.15/6.x 尚未适配。
+模块支持审查过的 **Linux 5.10–6.6** VM/uprobe 接口。目标内核提供内嵌 BTF 时，同一个 KPM 在加载时自动读取目标结构布局、初始化对应尺寸的 mutex/notifier/consumer，并识别 `get_user_pages_remote` 的 6/7 参数版本；用户不需要配置偏移或内核版本。内核函数原型、字段宽度和 KernelPatch 探测的 `mm.pgd` 偏移不符合要求时拒绝加载，不通过猜测偏移继续运行。
+
+LTO 将 `__copy_insn` 或 `dup_mmap` 内联时，自动使用 Linux 保留的架构解码入口和 uprobe fork 开始/结束入口。解码入口只在 BTF 证明该探针尚未解码、inode/偏移正确且仅属于本模块时替换原指令，随后仍由 Linux 解码。此路径要求文件页缓存读取成功，且磁盘入口不是 uprobe BRK；内存已解密而磁盘仍不可读或是 BRK 的入口会被拒绝。
+
+要求 `CONFIG_UPROBES`、`CONFIG_MMU_NOTIFIER`、ARM64 4KB 页，无 PREEMPT_RT 或 `CONFIG_DEBUG_LOCK_ALLOC`，VA/PA 不超过 48 位。缺少 BTF 时保留精确内核模式，仍须使用目标源码和完整配置编译，且 release 与 `mm.pgd` 偏移必须匹配。BTF 存在但校验失败时不会降级到精确内核模式。版本范围表示接口适配范围；实际设备验证范围以[验证记录](../../docs/kernel-trace-wxuprobe.md#5-实机验证)为准。
 
 目标必须是私有、可读可执行、不可写的普通文件映射，入口按 A64 的 4 字节对齐。文件偏移由 VMA 自动计算，支持同页多个入口。运行时解密后私有页与文件内容不同时，使用安装时的内存原指令。
 
@@ -28,9 +32,9 @@
 
 ## 构建
 
-### 1. 用匹配内核的 Kbuild 编译 VM/uprobe 实现
+### 1. 用 Kbuild 编译 VM/uprobe 实现
 
-在 Linux/WSL 的仓库根目录执行。内核准备方式可参考 [现有 VM 构建说明](../../docs/dobby-wxshadow-usage.md#31-准备与设备完全匹配的内核树)，不能用通用 headers 或修改 release 冒充匹配。
+在 Linux/WSL 的仓库根目录执行。可用 Linux 5.10–6.6 的已准备源码和配置编译基准对象；有 BTF 的目标由运行时适配，无需为每个目标重新构建对象。没有 BTF 的目标仍要求源码和配置精确匹配。内核准备方式可参考 [现有 VM 构建说明](../../docs/dobby-wxshadow-usage.md#31-准备与设备完全匹配的内核树)，不要修改 release 冒充精确匹配。
 
 ```sh
 WU_REPO="$PWD"

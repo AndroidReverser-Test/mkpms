@@ -1,5 +1,7 @@
 # Dobby WxShadow 后端：构建与使用
 
+2026-10-19 更新：portable KPM 已支持通过目标 BTF 自动适配 Linux 5.10–6.6，5.10 基准对象已在 6.1.134 设备通过 Dobby 和 ART JNI 测试。当前构建步骤、要求及测试范围以[跨内核兼容说明](kernel-compatibility.md)为准；下文精确 5.10 构建步骤保留为原实现记录。
+
 实现说明：[设计与实现](dobby-wxshadow-design.md)。测试证据：[验证记录](dobby-wxshadow-validation.md)。
 
 Native 回调中的 Java 参数读取见 [JNI 解析接入](dobby-jni-usage.md)，可通过 `DOBBY_WITH_JNI=ON` 与本后端一起使用。

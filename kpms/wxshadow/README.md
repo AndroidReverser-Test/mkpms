@@ -6,8 +6,9 @@ W^X Shadow Memory — 基于 KernelPatch 的用户态代码隐藏断点/Patch �
 
 ## Dobby 增强协议
 
-版本 1.1.0 增加 Dobby 的事务入口后端、能力查询、cookie 和安全撤销。
-使用与目标 Linux 5.10 完整源码/配置匹配的 Kbuild VM 适配对象。
+版本 1.2.0 增加 portable 增强协议桥：基准 Kbuild 对象通过目标 BTF 自动适配 Linux 5.10–6.6 的结构布局和 GUP API，无需手工配置偏移。已在 Linux 6.1.134 实机通过 Dobby 静态/动态及 ART JNI 测试。
+
+新构建传入适配对象时默认选择 portable，本文后续 legacy BP 命令不由该桥提供。构建、兼容边界及本次验证见[跨内核兼容说明](../../docs/kernel-compatibility.md)。
 
 参见 [Dobby 构建和使用](../../docs/dobby-wxshadow-usage.md)、[设计](../../docs/dobby-wxshadow-design.md) 和 [验证记录](../../docs/dobby-wxshadow-validation.md)。
 

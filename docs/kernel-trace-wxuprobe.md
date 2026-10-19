@@ -1,5 +1,7 @@
 # Kernel-Trace 与 wxshadow 的结合：wxuprobe
 
+2026-10-19 更新：新增 BTF 自动结构布局、GUP API 和 LTO 入口适配，已用 5.10 基准对象在 Pixel 6 / Android 16 / Linux 6.1.134 上通过完整设备脚本，包括 2000 个活动入口、全部寄存器、生命周期、tracefs 日志和完整卸载。当前要求及验证范围见[跨内核兼容说明](kernel-compatibility.md)；下文 5.10 记录属于原版实现。
+
 模块用法、编译和 ABI 见 [wxuprobe README](../kpms/wxuprobe/README.md)。本页记录现有实现的梳理、集成位置和实际验证范围。
 
 ## 1. 当前项目的逻辑

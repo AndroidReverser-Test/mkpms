@@ -3,8 +3,8 @@
 #define WXSHADOW_LINUX_BRIDGE_H
 #include "wxshadow_uapi.h"
 
-/* The native VM object is compiled with the EXACT running kernel's headers.
- * Keep this bridge independent of both Linux and KernelPatch struct layouts. */
+/* Keep this bridge independent of both Linux and KernelPatch struct layouts.
+ * The native object discovers the running kernel's layouts before use. */
 struct wx_linux_host {
   unsigned long (*lookup)(const char *name);
   void *(*alloc)(unsigned long bytes, unsigned int flags);
@@ -15,10 +15,16 @@ struct wx_linux_host {
   void *(*from_pfn)(unsigned long pfn);
   int (*legacy_page)(void *mm, unsigned long address);
   unsigned int mm_pgd_offset;
+  unsigned int page_shift, page_levels, kernel_version;
+  void *(*current_task)(void);
 };
 
 int wx_linux_init(const struct wx_linux_host *host);
 int wx_linux_request(int command, void *request, void *mm);
+/* Copy a self-mm request without depending on inline/LTO usercopy symbols.
+ * write==0 copies user to kernel, write==1 copies kernel to user. */
+int wx_linux_user_copy(void *buffer, unsigned long address,
+                       unsigned long size, int write);
 int wx_linux_fault(void *mm, unsigned long address, int access);
 /* A positive result holds the native control lock until after_fork, covering
  * the gap before dup_mmap acquires the old mm's mmap_lock. */

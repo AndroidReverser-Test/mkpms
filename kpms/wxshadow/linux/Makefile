@@ -1,4 +1,5 @@
-# Exact target kernel build tree required. This is a KPM object, not an LKM.
+# Build against an ARM64 baseline kernel. Runtime BTF supplies target layouts.
+# This is a KPM object, not an LKM.
 obj-m := wxshadow_linux_adapter.o
 ccflags-y += -I$(src)/../../../shared -fno-stack-protector -fno-builtin -mno-outline-atomics -ffixed-x18
 KASAN_SANITIZE := n

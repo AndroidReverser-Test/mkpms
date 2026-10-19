@@ -5,6 +5,7 @@
 #include "wxshadow_internal.h"
 #endif
 #include "wxshadow_linux.h"
+#include "../common/wx_arm64_runtime.h"
 
 static unsigned long (*wx_copy_from_user)(void *, const void *, unsigned long);
 static unsigned long (*wx_copy_to_user)(void *, const void *, unsigned long);
@@ -26,6 +27,7 @@ void wx_linux_legacy_unlock(void) {}
 #endif
 
 static unsigned long wx_to_pfn(void *address) { return kaddr_to_pfn((unsigned long)address); }
+static void *wx_current_task(void) { return current; }
 static int wx_legacy_page(void *mm, unsigned long address)
 {
     struct wxshadow_page *page = wxshadow_find_page(mm, address);
@@ -43,6 +45,12 @@ void wx_protocol_init(void)
         .free_page = kfunc_free_pages, .to_pfn = wx_to_pfn,
         .from_pfn = pfn_to_kaddr, .legacy_page = wx_legacy_page,
         .mm_pgd_offset = mm_struct_offset.pgd_offset,
+        .page_shift = wx_page_shift,
+        .kernel_version = wx_arm64_kernel_version((const char *)wxshadow_lookup_symbol("linux_banner")),
+#ifndef WXSHADOW_PROTOCOL_TEST
+        .page_levels = wx_page_level,
+#endif
+        .current_task = wx_current_task,
     };
     /* kzalloc/_copy_*_user are inline on ARM64. GKI LTO emits local clones
      * with specialized calling conventions under those exact names. Resolve
@@ -50,6 +58,7 @@ void wx_protocol_init(void)
      * copies also keep user faults from recursively entering our VM hooks.
      * Requests must be resident; EFAULT remains resolvable using the cookie. */
     host.alloc = (void *)wxshadow_lookup_symbol("__kmalloc");
+    if (!host.alloc) host.alloc = (void *)wxshadow_lookup_symbol("__kmalloc_noprof");
     wx_copy_from_user = (void *)wxshadow_lookup_symbol("copy_from_user_nofault");
     wx_copy_to_user = (void *)wxshadow_lookup_symbol("copy_to_user_nofault");
     /* Refuse to invent a reusable instance ID on kernels without entropy. */

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* Built separately by Kbuild, using the exact target kernel's configuration.
+/* Built separately by Kbuild. BTF supplies the running kernel's VM layout.
  * Never include KernelPatch's abbreviated Linux structs in this translation
  * unit. All non-inline kernel calls go through resolved function pointers.
  * Lock order: control -> mmap_lock -> state_lock -> kernel PTE lock.
@@ -23,8 +23,8 @@
 #if !defined(CONFIG_ARM64) || !defined(CONFIG_ARM64_4K_PAGES) || !defined(CONFIG_MMU_NOTIFIER)
 #error "wxshadow requires ARM64 4K pages and MMU_NOTIFIER"
 #endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) || LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
-#error "VM adapter currently supports Linux 5.10; audit other VM/GUP APIs first"
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#error "VM adapter requires Linux 5.10 or newer headers"
 #endif
 #ifdef CONFIG_PREEMPT_RT
 #error "PREEMPT_RT requires a separate locking audit"
@@ -35,8 +35,10 @@
 #endif
 
 static struct wx_linux_host host;
+#ifdef WXSHADOW_ADAPTER_TEST
 static DEFINE_MUTEX(control_lock);
 static DEFINE_MUTEX(state_lock);
+#endif
 static LIST_HEAD(contexts);
 static bool stopped;
 static bool ready;
@@ -56,7 +58,16 @@ static void (*read_unlock_fn)(struct rw_semaphore *);
 static void (*write_lock_fn)(struct rw_semaphore *);
 static void (*write_unlock_fn)(struct rw_semaphore *);
 static int (*walk_fn)(struct mm_struct *, unsigned long, unsigned long, pte_fn_t, void *);
+#ifdef WXSHADOW_ADAPTER_TEST
 static long (*gup_fn)(unsigned long, unsigned long, unsigned int, struct page **, struct vm_area_struct **);
+#else
+/* Keep the resolved address untyped until BTF chooses the running ABI. */
+static void *get_user_pages_symbol;
+typedef long (*wx_gup4_fn)(unsigned long, unsigned long, unsigned int, struct page **);
+typedef long (*wx_gup5_fn)(unsigned long, unsigned long, unsigned int, struct page **, struct vm_area_struct **);
+static wx_gup4_fn gup4_fn;
+static wx_gup5_fn gup5_fn;
+#endif
 static void (*release_pages_fn)(struct page **, int);
 static struct vm_area_struct *(*find_vma_fn)(struct mm_struct *, unsigned long);
 static int (*register_fn)(struct mmu_notifier *, struct mm_struct *);
@@ -66,14 +77,19 @@ static bool (*capable_fn)(int);
 static void *(*memcpy_fn)(void *, const void *, size_t);
 static int (*memcmp_fn)(const void *, const void *, size_t);
 static void *(*memset_fn)(void *, int, size_t);
-static s64 *wx_memstart_addr;
-/* page_to_pfn's vmemmap macro uses the running memstart_addr. Avoid an
- * unresolved variable reference in the relocatable KPM object. */
-#define memstart_addr (*wx_memstart_addr)
+#ifndef WXSHADOW_ADAPTER_TEST
+#include "wxshadow_layout.h"
+#else
+#define WX_FIELD(type, object, offset) (*(type *)((char *)(object) + (offset)))
+#define WX_MM_LOCK(mm) (&(mm)->mmap_lock)
+#define WX_MM_COUNT(mm) ((mm)->mm_count.counter)
+#define WX_VMA(type, vma, member) ((vma)->vm_##member)
+#define wx_compat_task() is_compat_task()
+#endif
 
 static void drop_mm(struct mm_struct *mm)
 {
-    if (__atomic_sub_fetch(&mm->mm_count.counter, 1, __ATOMIC_ACQ_REL) == 0) mmdrop_fn(mm);
+    if (__atomic_sub_fetch(&WX_MM_COUNT(mm), 1, __ATOMIC_ACQ_REL) == 0) mmdrop_fn(mm);
 }
 
 struct tx_context;
@@ -99,7 +115,7 @@ struct tx_shadow {
 };
 struct tx_context {
     struct list_head node, pages, records, shadows;
-    struct mmu_notifier notifier;
+    struct mmu_notifier *notifier;
     struct mm_struct *mm;
     bool released;
 };
@@ -182,6 +198,7 @@ static void replace_pte(pte_t *ptep, unsigned long address, u64 value)
 #endif
 }
 struct pte_operation {
+    struct tx_context *context;
     struct tx_page *page;
     u64 value;
     bool capture, wrote, visited;
@@ -194,8 +211,17 @@ static int operate_pte(pte_t *ptep, unsigned long address, void *argument)
     op->visited = true;
     if (op->capture) {
         if (!pte_valid(__pte(old)) || !(old & PTE_USER) || pte_special(__pte(old)) ||
-            (old & (PTE_UXN | PTE_CONT)) || !(old & PTE_RDONLY) ||
-            pte_pfn(__pte(old)) != page->pfn) return -ESTALE;
+            (old & (PTE_UXN | PTE_CONT)) || !(old & PTE_RDONLY)) return -ESTALE;
+#ifndef WXSHADOW_ADAPTER_TEST
+        {
+            struct vm_area_struct *vma = find_vma_fn(op->context->mm, address);
+            if (!vma || WX_VMA(unsigned long, vma, start) > address ||
+                normal_page_fn(vma, address, __pte(old)) != page->pin) return -ESTALE;
+            page->pfn = pte_pfn(__pte(old));
+        }
+#else
+        if (pte_pfn(__pte(old)) != page->pfn) return -ESTALE;
+#endif
 #ifdef PTE_GP
         if (old & PTE_GP) return -EOPNOTSUPP;
 #endif
@@ -220,16 +246,16 @@ static int operate_pte(pte_t *ptep, unsigned long address, void *argument)
 }
 static int page_operation(struct tx_context *ctx, struct tx_page *page, u64 value, bool capture)
 {
-    struct pte_operation op = { .page = page, .value = value, .capture = capture };
+    struct pte_operation op = { .context = ctx, .page = page, .value = value, .capture = capture };
     int rc, level;
 #ifndef WXSHADOW_ADAPTER_TEST
-    u64 *table = (u64 *)ctx->mm->pgd;
+    u64 *table = WX_FIELD(u64 *, ctx->mm, layout.mm_pgd);
     /* apply_to_existing_page_range BUG_ONs on huge/block mappings in 5.10.
      * Check each upper descriptor first. from_pfn uses the running direct-map
      * translation; compiled-in __va helpers can depend on unrelocated globals.
      * Actual PTE access and modification still happen in the kernel walker/PTL.
      */
-    for (level = CONFIG_PGTABLE_LEVELS - 1; level > 0; --level) {
+    for (level = host.page_levels - 1; level > 0; --level) {
         unsigned int index = (page->address >> (PAGE_SHIFT + level * 9)) & 511;
         u64 descriptor = READ_ONCE(table[index]);
         if ((descriptor & 3) != 3) return -EOPNOTSUPP;
@@ -250,21 +276,29 @@ static void restore_and_retire(struct tx_context *ctx, struct tx_page *page)
 
 static int invalidate_start(struct mmu_notifier *notifier, const struct mmu_notifier_range *range)
 {
-    struct tx_context *ctx = container_of(notifier, struct tx_context, notifier);
+    struct tx_context *ctx = ((struct tx_context **)notifier)[-1];
     struct tx_page *page;
+    unsigned long start, end;
     /* Atomic invalidations must retry in a blockable context. We do not take a
      * sleeping lock or a VM walk from the nonblockable callback. */
+#ifndef WXSHADOW_ADAPTER_TEST
+    if (!(WX_FIELD(unsigned int, range, layout.range_flags) & 1)) return -EAGAIN;
+    start = WX_FIELD(unsigned long, range, layout.range_start);
+    end = WX_FIELD(unsigned long, range, layout.range_end);
+#else
     if (!mmu_notifier_range_blockable(range)) return -EAGAIN;
+    start = range->start; end = range->end;
+#endif
     lock_fn(&state_lock);
     list_for_each_entry(page, &ctx->pages, node)
-        if (page->active && page->address < range->end && page->address + PAGE_SIZE > range->start)
+        if (page->active && page->address < end && page->address + PAGE_SIZE > start)
             restore_and_retire(ctx, page);
     unlock_fn(&state_lock);
     return 0;
 }
 static void mm_release(struct mmu_notifier *notifier, struct mm_struct *mm)
 {
-    struct tx_context *ctx = container_of(notifier, struct tx_context, notifier);
+    struct tx_context *ctx = ((struct tx_context **)notifier)[-1];
     struct tx_page *page;
     /* exit_mmap invokes release before freeing page tables. mm_users is zero,
      * so no user can mutate this address space; do not reacquire mmap_lock. */
@@ -273,9 +307,11 @@ static void mm_release(struct mmu_notifier *notifier, struct mm_struct *mm)
     ctx->released = true;
     unlock_fn(&state_lock);
 }
+#ifdef WXSHADOW_ADAPTER_TEST
 static const struct mmu_notifier_ops notifier_ops = {
     .release = mm_release, .invalidate_range_start = invalidate_start,
 };
+#endif
 
 /* control_lock held. Registration takes mmap_lock internally; no state lock. */
 static struct tx_context *get_context(struct mm_struct *mm)
@@ -287,11 +323,26 @@ static struct tx_context *get_context(struct mm_struct *mm)
     ctx = alloc_zero(sizeof(*ctx));
     if (!ctx) return NULL;
     INIT_LIST_HEAD(&ctx->pages); INIT_LIST_HEAD(&ctx->records); INIT_LIST_HEAD(&ctx->shadows);
-    ctx->notifier.ops = &notifier_ops; ctx->mm = mm;
+    ctx->mm = mm;
+#ifndef WXSHADOW_ADAPTER_TEST
+    ctx->notifier = alloc_zero(sizeof(void *) + layout.notifier_size);
+#else
+    ctx->notifier = alloc_zero(sizeof(void *) + sizeof(*ctx->notifier));
+#endif
+    if (!ctx->notifier) { host.free(ctx); return NULL; }
+    ((struct tx_context **)ctx->notifier)[0] = ctx;
+    ctx->notifier = (void *)((char *)ctx->notifier + sizeof(void *));
+#ifndef WXSHADOW_ADAPTER_TEST
+    WX_FIELD(void *, ctx->notifier, layout.notifier_ops) = notifier_ops_storage;
+#else
+    ctx->notifier->ops = &notifier_ops;
+#endif
     /* LL/SC builtins avoid depending on Linux alternatives/static-key tables
      * that the KPM loader does not relocate like the Linux module loader. */
-    __atomic_add_fetch(&mm->mm_count.counter, 1, __ATOMIC_RELAXED);
-    if (register_fn(&ctx->notifier, mm)) { drop_mm(mm); host.free(ctx); return NULL; }
+    __atomic_add_fetch(&WX_MM_COUNT(mm), 1, __ATOMIC_RELAXED);
+    if (register_fn(ctx->notifier, mm)) {
+        drop_mm(mm); host.free((char *)ctx->notifier - sizeof(void *)); host.free(ctx); return NULL;
+    }
     lock_fn(&state_lock); tx_link_tail(&ctx->node, &contexts); ++context_count; unlock_fn(&state_lock);
     return ctx;
 }
@@ -302,9 +353,10 @@ static int valid_vma(struct mm_struct *mm, unsigned long address)
 #ifdef VM_ARM64_BTI
     unsupported |= VM_ARM64_BTI;
 #endif
-    return vma && vma->vm_start <= address && vma->vm_end - address >= 4 &&
-           (vma->vm_flags & (VM_READ | VM_EXEC)) == (VM_READ | VM_EXEC) &&
-           !(vma->vm_flags & unsupported);
+    return vma && WX_VMA(unsigned long, vma, start) <= address &&
+           WX_VMA(unsigned long, vma, end) - address >= 4 &&
+           (WX_VMA(unsigned long, vma, flags) & (VM_READ | VM_EXEC)) == (VM_READ | VM_EXEC) &&
+           !(WX_VMA(unsigned long, vma, flags) & unsupported);
 }
 static struct tx_shadow *prepare_shadow(struct tx_context *ctx, struct tx_page *page,
                                         struct tx_record *skip, const struct wx_patch_request *add)
@@ -377,19 +429,31 @@ static int install(struct tx_context *ctx, struct wx_patch_request *req)
         /* get_user_pages requires the caller to hold mmap_lock. Do not hold
          * state_lock: its follow_page_pte hook also takes that lock. Capture
          * revalidates the VMA and PFN later under the write lock. */
-        read_lock_fn(&ctx->mm->mmap_lock);
+        read_lock_fn(WX_MM_LOCK(ctx->mm));
+#ifndef WXSHADOW_ADAPTER_TEST
+        if (layout.gup_arity == 4)
+            got = gup4_fn(req->address & PAGE_MASK, 1, 0, &pin);
+        else
+            got = gup5_fn(req->address & PAGE_MASK, 1, 0, &pin, NULL);
+#else
         got = gup_fn(req->address & PAGE_MASK, 1, 0, &pin, NULL);
-        read_unlock_fn(&ctx->mm->mmap_lock);
+#endif
+        read_unlock_fn(WX_MM_LOCK(ctx->mm));
         if (got != 1) return got < 0 ? got : -EFAULT;
+#ifdef WXSHADOW_ADAPTER_TEST
         if (PageCompound(pin)) { release_pages_fn(&pin, 1); return -EOPNOTSUPP; }
+#endif
         page = alloc_zero(sizeof(*page));
         if (!page) { release_pages_fn(&pin, 1); return -ENOMEM; }
-        page->pin = pin; page->pfn = page_to_pfn(pin); page->address = req->address & PAGE_MASK;
+        page->pin = pin; page->address = req->address & PAGE_MASK;
+#ifdef WXSHADOW_ADAPTER_TEST
+        page->pfn = page_to_pfn(pin);
+#endif
         fresh = true;
     }
     record = alloc_zero(sizeof(*record));
     if (!record) { rc = -ENOMEM; goto out; }
-    write_lock_fn(&ctx->mm->mmap_lock);
+    write_lock_fn(WX_MM_LOCK(ctx->mm));
     lock_fn(&state_lock);
     if (ctx->released || !valid_vma(ctx->mm, req->address) || host.legacy_page(ctx->mm, req->address)) {
         rc = -EOPNOTSUPP; goto unlock;
@@ -421,7 +485,7 @@ static int install(struct tx_context *ctx, struct wx_patch_request *req)
     ++record_count;
 unlock:
     unlock_fn(&state_lock);
-    write_unlock_fn(&ctx->mm->mmap_lock);
+    write_unlock_fn(WX_MM_LOCK(ctx->mm));
 out:
     free_shadow(shadow); host.free(record);
     if (rc && fresh) { release_pages_fn(&page->pin, 1); host.free(page); }
@@ -434,7 +498,7 @@ static int identify(struct tx_context *ctx, struct wx_identity *id, bool remove)
     struct tx_shadow *shadow = NULL;
     unsigned int remaining = 0;
     int rc = 0;
-    if (remove) write_lock_fn(&ctx->mm->mmap_lock);
+    if (remove) write_lock_fn(WX_MM_LOCK(ctx->mm));
     lock_fn(&state_lock);
     record = find_record(ctx, id->cookie);
     if (!record) { id->state = WX_PATCH_ABSENT; goto out; }
@@ -458,7 +522,7 @@ static int identify(struct tx_context *ctx, struct wx_identity *id, bool remove)
     record->state = id->state = WX_PATCH_RETIRED;
 out:
     unlock_fn(&state_lock);
-    if (remove) write_unlock_fn(&ctx->mm->mmap_lock);
+    if (remove) write_unlock_fn(WX_MM_LOCK(ctx->mm));
     free_shadow(shadow);
     return rc;
 }
@@ -479,14 +543,14 @@ static int quiesce(void)
     /* Unregister can sleep and synchronize SRCU: this MUST run in prctl,
      * never inside KP's unload callback (the pinned loader holds RCU). */
     list_for_each_entry_safe(ctx, next, &contexts, node) {
-        unregister_fn(&ctx->notifier, ctx->mm);
+        unregister_fn(ctx->notifier, ctx->mm);
         lock_fn(&state_lock); tx_unlink(&ctx->node); unlock_fn(&state_lock);
         list_for_each_entry_safe(record, rnext, &ctx->records, node) host.free(record);
         list_for_each_entry_safe(page, pnext, &ctx->pages, node) {
             release_pages_fn(&page->pin, 1); host.free(page);
         }
         list_for_each_entry_safe(shadow, snext, &ctx->shadows, node) free_shadow(shadow);
-        drop_mm(ctx->mm); host.free(ctx);
+        drop_mm(ctx->mm); host.free((char *)ctx->notifier - sizeof(void *)); host.free(ctx);
     }
     context_count = retained_page_count = record_count = shadow_count = 0;
     return 0;
@@ -497,9 +561,15 @@ int wx_linux_request(int command, void *request, void *mm)
     struct wx_patch_request *patch = request;
     struct tx_context *ctx;
     int rc;
-    if (!is_ready() || is_compat_task()) return -EOPNOTSUPP;
+    if (!is_ready() || wx_compat_task()) return -EOPNOTSUPP;
     if (command != PR_WXSHADOW_QUIESCE &&
-        (!id->cookie || !id->address || (id->address & 3) || id->address >= ((struct mm_struct *)mm)->task_size)) return -EINVAL;
+        (!id->cookie || !id->address || (id->address & 3) || id->address >=
+#ifndef WXSHADOW_ADAPTER_TEST
+         WX_FIELD(unsigned long, mm, layout.mm_task_size)
+#else
+         ((struct mm_struct *)mm)->task_size
+#endif
+         )) return -EINVAL;
     if (command == PR_WXSHADOW_PATCH_EX && (patch->replacement & 0xfc000000U) != 0x14000000U) return -EINVAL;
     lock_fn(&control_lock);
     if (command == PR_WXSHADOW_QUIESCE) { rc = quiesce(); goto out; }
@@ -520,7 +590,7 @@ int wx_linux_fault(void *mm, unsigned long address, int access)
     struct tx_page *page;
     int handled = 0;
     if (!is_ready()) return 0;
-    read_lock_fn(&((struct mm_struct *)mm)->mmap_lock);
+    read_lock_fn(WX_MM_LOCK((struct mm_struct *)mm));
     lock_fn(&state_lock);
     ctx = find_context(mm); page = ctx ? find_page(ctx, address) : NULL;
     if (page) {
@@ -533,7 +603,7 @@ int wx_linux_fault(void *mm, unsigned long address, int access)
         }
     }
     unlock_fn(&state_lock);
-    read_unlock_fn(&((struct mm_struct *)mm)->mmap_lock);
+    read_unlock_fn(WX_MM_LOCK((struct mm_struct *)mm));
     return handled;
 }
 int wx_linux_before_fork(void *mm)
@@ -546,11 +616,11 @@ int wx_linux_before_fork(void *mm)
      * before the original dup_mmap acquires that lock itself. */
     lock_fn(&control_lock);
     if (stopped) { unlock_fn(&control_lock); return 0; }
-    write_lock_fn(&((struct mm_struct *)mm)->mmap_lock);
+    write_lock_fn(WX_MM_LOCK((struct mm_struct *)mm));
     lock_fn(&state_lock); ctx = find_context(mm);
     if (ctx) list_for_each_entry(page, &ctx->pages, node) restore_and_retire(ctx, page);
     unlock_fn(&state_lock);
-    write_unlock_fn(&((struct mm_struct *)mm)->mmap_lock);
+    write_unlock_fn(WX_MM_LOCK((struct mm_struct *)mm));
     return 1;
 }
 void wx_linux_after_fork(void) { unlock_fn(&control_lock); }
@@ -561,7 +631,7 @@ void wx_linux_before_gup(void *vma_pointer, unsigned long address)
     struct tx_page *page;
     if (!is_ready() || !vma) return;
     /* follow_page_pte is entered with mmap_lock held and before its PTL. */
-    lock_fn(&state_lock); ctx = find_context(vma->vm_mm);
+    lock_fn(&state_lock); ctx = find_context(WX_VMA(struct mm_struct *, vma, mm));
     page = ctx ? find_page(ctx, address) : NULL;
     if (page) restore_and_retire(ctx, page);
     unlock_fn(&state_lock);
@@ -578,7 +648,7 @@ int wx_linux_owns(void *mm, unsigned long address)
     unlock_fn(&state_lock); return result;
 }
 int wx_linux_is_quiesced(void) { return !is_ready() || READ_ONCE(stopped); }
-int wx_linux_available(void) { return is_ready() && !is_compat_task() && !READ_ONCE(stopped); }
+int wx_linux_available(void) { return is_ready() && !wx_compat_task() && !READ_ONCE(stopped); }
 int wx_linux_legacy_lock(void)
 {
     if (!is_ready()) return 0;
@@ -590,21 +660,53 @@ void wx_linux_legacy_unlock(void) { unlock_fn(&control_lock); }
 #define RESOLVE(field, symbol) do { field = (void *)host.lookup(symbol); if (!field) return -EOPNOTSUPP; } while (0)
 int wx_linux_init(const struct wx_linux_host *h)
 {
+#ifdef WXSHADOW_ADAPTER_TEST
     const char *banner;
     const char expected[] = "Linux version " UTS_RELEASE " ";
+#else
+    int rc;
+#endif
     host = *h;
-    RESOLVE(wx_memstart_addr, "memstart_addr");
     RESOLVE(memcpy_fn, "memcpy"); RESOLVE(memcmp_fn, "memcmp"); RESOLVE(memset_fn, "memset");
+#ifdef WXSHADOW_ADAPTER_TEST
     banner = (const char *)host.lookup("linux_banner");
     if (!banner || memcmp_fn(banner, expected, sizeof(expected) - 1) ||
         h->mm_pgd_offset != offsetof(struct mm_struct, pgd)) return -EPROTO;
+#else
+    rc = init_layout();
+    if (rc) return rc;
+    WX_FIELD(void *, notifier_ops_storage, layout.ops_release) = mm_release;
+    WX_FIELD(void *, notifier_ops_storage, layout.ops_start) = invalidate_start;
+#endif
     RESOLVE(lock_fn, "mutex_lock"); RESOLVE(unlock_fn, "mutex_unlock");
     RESOLVE(read_lock_fn, "down_read"); RESOLVE(read_unlock_fn, "up_read");
     RESOLVE(write_lock_fn, "down_write"); RESOLVE(write_unlock_fn, "up_write");
-    RESOLVE(walk_fn, "apply_to_existing_page_range"); RESOLVE(gup_fn, "get_user_pages");
+    RESOLVE(walk_fn, "apply_to_existing_page_range");
+#ifdef WXSHADOW_ADAPTER_TEST
+    RESOLVE(gup_fn, "get_user_pages");
+#else
+    RESOLVE(get_user_pages_symbol, "get_user_pages");
+    if (layout.gup_arity == 4) gup4_fn = (wx_gup4_fn)get_user_pages_symbol;
+    else gup5_fn = (wx_gup5_fn)get_user_pages_symbol;
+#endif
     RESOLVE(release_pages_fn, "release_pages"); RESOLVE(find_vma_fn, "find_vma");
     RESOLVE(register_fn, "mmu_notifier_register"); RESOLVE(unregister_fn, "mmu_notifier_unregister");
     RESOLVE(mmdrop_fn, "__mmdrop"); RESOLVE(capable_fn, "capable");
     __atomic_store_n(&ready, true, __ATOMIC_RELEASE);
     return 0;
 }
+
+#ifndef WXSHADOW_ADAPTER_TEST
+int wx_linux_user_copy(void *buffer, unsigned long address, unsigned long size, int write)
+{
+    struct task_struct *task = host.current_task();
+    struct mm_struct *mm = WX_FIELD(struct mm_struct *, task, layout.task_mm);
+    unsigned long limit;
+    /* Android heap pointers can carry a top-byte allocator tag. */
+    address &= 0x00ffffffffffffffUL;
+    if (!mm || wx_compat_task()) return -EOPNOTSUPP;
+    limit = WX_FIELD(unsigned long, mm, layout.mm_task_size);
+    if (!address || address >= limit || size > limit - address || size > 0x7fffffffUL) return -EFAULT;
+    return access_vm_fn(task, address, buffer, (int)size, write ? FOLL_WRITE : 0) == size ? 0 : -EFAULT;
+}
+#endif

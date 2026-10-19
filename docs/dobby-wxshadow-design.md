@@ -1,5 +1,7 @@
 # Dobby 接入 wxshadow 设计方案
 
+2026-10-19 更新：新增独立 portable 桥与 BTF 运行时适配，替代下文原版设计中的固定 5.10 VM 布局要求。实现变化及当前兼容边界见[跨内核兼容说明](kernel-compatibility.md)；以下日期及旧版边界为历史设计记录。
+
 日期：2026-10-18。状态：P1 已实现，已通过 Android 12 / ARM64 / Linux 5.10.66 实机静态库和动态库测试。构建、接口、限制及测试记录见 [使用文档](dobby-wxshadow-usage.md) 和 [验证记录](dobby-wxshadow-validation.md)。P2 不属于本次支持范围。
 
 分析基线：mkpms `29c4187`；本地 Dobby `5dfc8546954ce3b3198132ab13fddb89ee92cdd7`。

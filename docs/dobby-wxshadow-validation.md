@@ -1,5 +1,7 @@
 # Dobby WxShadow 验证记录
 
+2026-10-19 新增：使用 5.10 基准对象构建的 portable KPM 已在 Pixel 6 / Android 16 / Linux 6.1.134 上通过静态/动态 Dobby 与四组 ART JNI 回归、QUIESCE 和卸载。完整兼容说明与新测试矩阵见[跨内核兼容记录](kernel-compatibility.md#本次验证)。以下保留 2026-10-18 的旧版测试证据。
+
 日期：2026-10-18。测试代码在 `tests/`；接口与构建说明见 [使用文档](dobby-wxshadow-usage.md)。
 
 ## 环境

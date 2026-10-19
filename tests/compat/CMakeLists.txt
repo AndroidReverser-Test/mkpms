@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.18)
+project(kernel_compat_tests LANGUAGES C)
+enable_testing()
+add_executable(btf_tests btf_tests.c)
+target_compile_options(btf_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME btf_parser COMMAND btf_tests)

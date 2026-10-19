@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * Exact-kernel implementation. Page publication, retirement and TLB/cache
+ * Runtime-validated implementation. Page publication, retirement and TLB/cache
  * handling follow kpms/wxshadow/linux/wxshadow_linux_adapter.c (GPL-2.0+).
  * Linux owns uprobe decoding, BRK delivery, XOL slots and single stepping.
  * We redirect only our uprobe's opcode publication to an execute-only page.
@@ -24,12 +24,13 @@
 #include <generated/utsrelease.h>
 #include <asm/pgtable.h>
 #include "../wxuprobe_bridge.h"
+#include "../../common/wx_btf.h"
 
 #if !defined(CONFIG_ARM64_4K_PAGES) || !defined(CONFIG_MMU_NOTIFIER) || !defined(CONFIG_UPROBES)
 #error "wxuprobe requires ARM64 4K pages, MMU_NOTIFIER and UPROBES"
 #endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) || LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
-#error "wxuprobe currently supports the audited Linux 5.10 VM/uprobe APIs"
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) || LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+#error "wxuprobe supports the audited Linux 5.10 through 6.6 VM/uprobe APIs"
 #endif
 #if CONFIG_ARM64_PA_BITS > 48 || CONFIG_ARM64_VA_BITS > 48 || defined(CONFIG_PREEMPT_RT) || defined(CONFIG_GCC_PLUGIN_RANDSTRUCT) || defined(CONFIG_RANDSTRUCT)
 #error "unsupported physical/virtual address width, RT locking or randomized layout"
@@ -42,8 +43,49 @@
 #define WU_MAX_SHADOWS 8192U
 
 static struct wu_host host;
-static DEFINE_MUTEX(control_lock);
-static DEFINE_MUTEX(state_lock);
+/* Kernel-owned objects use target BTF sizes and offsets, never the compiler's
+ * configuration-dependent layout. The union supplies natural alignment. */
+#define WU_OPAQUE_MAX 512U
+union wu_opaque { u64 align; unsigned char bytes[WU_OPAQUE_MAX]; };
+static union wu_opaque control_storage, state_storage, control_key, state_key;
+static struct mutex *control_mutex = (void *)&control_storage;
+static struct mutex *state_mutex = (void *)&state_storage;
+#define control_lock (*control_mutex)
+#define state_lock (*state_mutex)
+static struct wx_btf btf;
+static bool dynamic_layout;
+static unsigned int notifier_size, consumer_size;
+static union wu_opaque notifier_ops_storage;
+struct wu_offsets {
+    unsigned int mm_pgd, mm_lock, mm_count, mm_task_size;
+    unsigned int task_mm, task_tgid, task_cred, task_flags, cred_uid;
+    unsigned int vma_start, vma_end, vma_flags, vma_file, vma_offset, vma_mm;
+    unsigned int file_inode, file_count, inode_mode, inode_mapping;
+    unsigned int notifier_ops, range_start, range_end, range_flags;
+    unsigned int ops_release, ops_invalidate;
+    unsigned int consumer_handler, consumer_filter, consumer_next;
+    unsigned int arch_insn;
+    unsigned int uprobe_arch, uprobe_inode, uprobe_offset, uprobe_consumers, uprobe_flags;
+} offsets;
+#define WU_FIELD(type, object, member) (*(type *)((char *)(object) + offsets.member))
+#define MM_PGD(mm) WU_FIELD(void *, mm, mm_pgd)
+#define MM_LOCK(mm) ((struct rw_semaphore *)((char *)(mm) + offsets.mm_lock))
+#define MM_COUNT(mm) WU_FIELD(int, mm, mm_count)
+#define MM_TASK_SIZE(mm) WU_FIELD(unsigned long, mm, mm_task_size)
+#define TASK_MM(task) WU_FIELD(struct mm_struct *, task, task_mm)
+#define TASK_TGID(task) WU_FIELD(int, task, task_tgid)
+#define TASK_CRED(task) WU_FIELD(const struct cred *, task, task_cred)
+#define CRED_UID(cred) WU_FIELD(unsigned int, cred, cred_uid)
+#define VMA_START(vma) WU_FIELD(unsigned long, vma, vma_start)
+#define VMA_END(vma) WU_FIELD(unsigned long, vma, vma_end)
+#define VMA_FLAGS(vma) WU_FIELD(unsigned long, vma, vma_flags)
+#define VMA_FILE(vma) WU_FIELD(struct file *, vma, vma_file)
+#define VMA_OFFSET(vma) WU_FIELD(unsigned long, vma, vma_offset)
+#define VMA_MM(vma) WU_FIELD(struct mm_struct *, vma, vma_mm)
+#define FILE_INODE(file) WU_FIELD(struct inode *, file, file_inode)
+#define FILE_COUNT(file) WU_FIELD(long, file, file_count)
+#define INODE_MODE(inode) WU_FIELD(umode_t, inode, inode_mode)
+#define INODE_MAPPING(inode) WU_FIELD(void *, inode, inode_mapping)
 static LIST_HEAD(contexts);
 static bool ready, stopped;
 static u64 instance, legacy_cookie;
@@ -72,6 +114,9 @@ static bool (*capable_fn)(int);
 static struct vm_area_struct *(*find_vma_fn)(struct mm_struct *, unsigned long);
 static long (*gup_fn)(struct mm_struct *, unsigned long, unsigned long,
                       unsigned int, struct page **, struct vm_area_struct **, int *);
+static long (*gup6_fn)(struct mm_struct *, unsigned long, unsigned long,
+                      unsigned int, struct page **, int *);
+static struct page *(*normal_page_fn)(struct vm_area_struct *, unsigned long, pte_t);
 static void (*release_pages_fn)(struct page **, int);
 static int (*walk_fn)(struct mm_struct *, unsigned long, unsigned long, pte_fn_t, void *);
 static int (*notifier_register_fn)(struct mmu_notifier *, struct mm_struct *);
@@ -82,9 +127,9 @@ static int (*access_vm_fn)(struct task_struct *, unsigned long, void *, int, uns
 static struct file *(*open_fn)(const char *, int, umode_t);
 static void (*fput_fn)(struct file *);
 static int (*trace_fn)(unsigned long, const char *, ...);
+static int (*trace_puts_fn)(unsigned long, const char *, int);
+static int (*format_fn)(char *, size_t, const char *, ...);
 static int (*message_fn)(const char *, ...);
-static s64 *wu_memstart_addr;
-#define memstart_addr (*wu_memstart_addr)
 
 struct wu_context;
 struct wu_page {
@@ -98,7 +143,7 @@ struct wu_page {
 struct wu_shadow { struct list_head node; void *address; };
 struct wu_probe {
     struct list_head node;
-    struct uprobe_consumer consumer;
+    struct uprobe_consumer *consumer;
     struct wu_context *context;
     struct wu_page *page;
     struct file *file;
@@ -109,7 +154,7 @@ struct wu_probe {
 };
 struct wu_context {
     struct list_head node, pages, probes, shadows;
-    struct mmu_notifier notifier;
+    struct mmu_notifier *notifier;
     struct mm_struct *mm;
     bool released;
     unsigned long legacy_base;
@@ -119,28 +164,36 @@ struct wu_context {
  * The task check prevents unrelated registrations from using live bytes. */
 static struct wu_probe *operation;
 static struct task_struct *operation_task;
+/* Only accessed while owning control_lock, except the end's owner check.
+ * The global control lock permits exactly one paired fork window at a time. */
+static struct task_struct *fork_owner;
 
 static bool is_ready(void) { return __atomic_load_n(&ready, __ATOMIC_ACQUIRE); }
+static bool trace_supported(void) { return (trace_puts_fn && format_fn) || trace_fn; }
+static bool compat_task(void)
+{
+    return (WU_FIELD(unsigned long, current, task_flags) & (1UL << TIF_32BIT)) != 0;
+}
 /* Run outside control/state/mmap locks: GUP can fault, break COW and invoke
  * our retirement callback. No FOLL_FORCE: normal user VMA permissions apply.
  * Calling native access_process_vm also preserves the kernel's PAN/uaccess
  * handling, without embedding unprocessed Linux alternatives in the KPM. */
 static int copy_user_buffer(void *buffer, unsigned long address, size_t size, bool write)
 {
-    struct mm_struct *mm = current->mm;
+    struct mm_struct *mm = TASK_MM(current);
     /* Android's allocator uses tagged heap pointers even without MTE. */
     address = untagged_addr(address);
-    if (!mm || !address || address >= mm->task_size || size > mm->task_size - address ||
+    if (!mm || !address || address >= MM_TASK_SIZE(mm) || size > MM_TASK_SIZE(mm) - address ||
         size > INT_MAX) return -EFAULT;
     return access_vm_fn(current, address, buffer, (int)size, write ? FOLL_WRITE : 0) == size ? 0 : -EFAULT;
 }
 static void *from_pfn(unsigned long pfn)
 {
-    return (void *)(((pfn << PAGE_SHIFT) - *wu_memstart_addr) | PAGE_OFFSET);
+    return host.from_pfn(pfn);
 }
 static unsigned long to_pfn(void *address)
 {
-    return (((unsigned long)address & ~PAGE_OFFSET) + *wu_memstart_addr) >> PAGE_SHIFT;
+    return host.to_pfn(address);
 }
 static void *alloc_zero(size_t size)
 {
@@ -223,10 +276,12 @@ static int operate_pte(pte_t *ptep, unsigned long address, void *argument)
     if (op->capture) {
         if (!pte_valid(__pte(old)) || !(old & PTE_USER) || pte_special(__pte(old)) ||
             (old & (PTE_UXN | PTE_CONT)) || !(old & PTE_RDONLY) ||
-            pte_pfn(__pte(old)) != page->pfn) return -ESTALE;
+            normal_page_fn(find_vma_fn(page->context->mm, address), address, __pte(old)) != page->pin)
+            return -ESTALE;
 #ifdef PTE_GP
         if (old & PTE_GP) return -EOPNOTSUPP;
 #endif
+        page->pfn = pte_pfn(__pte(old));
         page->original_pte = old; page->read_pte = old | PTE_UXN;
         return 0;
     }
@@ -246,10 +301,10 @@ static int operate_pte(pte_t *ptep, unsigned long address, void *argument)
 static int page_operation(struct wu_page *page, u64 value, bool capture)
 {
     struct pte_operation op = {.page = page, .value = value, .capture = capture};
-    u64 *table = (u64 *)page->context->mm->pgd;
+    u64 *table = (u64 *)MM_PGD(page->context->mm);
     int rc, level;
     /* Linux 5.10's existing-page walker BUG_ONs on blocks/huge pages. */
-    for (level = CONFIG_PGTABLE_LEVELS - 1; level > 0; --level) {
+    for (level = host.page_levels - 1; level > 0; --level) {
         unsigned int index = (page->address >> (PAGE_SHIFT + level * 9)) & 511;
         u64 descriptor = READ_ONCE(table[index]);
         if ((descriptor & 3) != 3) return -EOPNOTSUPP;
@@ -271,31 +326,35 @@ static void retire_page(struct wu_page *page, int error)
 }
 static int invalidate_start(struct mmu_notifier *notifier, const struct mmu_notifier_range *range)
 {
-    struct wu_context *ctx = container_of(notifier, struct wu_context, notifier);
+    struct wu_context *ctx;
     struct wu_page *page;
-    if (!mmu_notifier_range_blockable(range)) return -EAGAIN;
+    if (!(WU_FIELD(unsigned int, range, range_flags) & MMU_NOTIFIER_RANGE_BLOCKABLE)) return -EAGAIN;
     lock_fn(&state_lock);
+    list_for_each_entry(ctx, &contexts, node) if (ctx->notifier == notifier) goto found;
+    unlock_fn(&state_lock); return 0;
+found:
     list_for_each_entry(page, &ctx->pages, node)
-        if (page->active && page->address < range->end && page->address + PAGE_SIZE > range->start)
+        if (page->active && page->address < WU_FIELD(unsigned long, range, range_end) &&
+            page->address + PAGE_SIZE > WU_FIELD(unsigned long, range, range_start))
             retire_page(page, -ESTALE);
     unlock_fn(&state_lock);
     return 0;
 }
 static void mm_release(struct mmu_notifier *notifier, struct mm_struct *mm)
 {
-    struct wu_context *ctx = container_of(notifier, struct wu_context, notifier);
+    struct wu_context *ctx;
     struct wu_page *page;
     lock_fn(&state_lock);
+    list_for_each_entry(ctx, &contexts, node) if (ctx->notifier == notifier) goto found;
+    unlock_fn(&state_lock); return;
+found:
     list_for_each_entry(page, &ctx->pages, node) if (page->active) retire_page(page, -ESRCH);
     ctx->released = true;
     unlock_fn(&state_lock);
 }
-static const struct mmu_notifier_ops notifier_ops = {
-    .release = mm_release, .invalidate_range_start = invalidate_start,
-};
 static void drop_mm(struct mm_struct *mm)
 {
-    if (__atomic_sub_fetch(&mm->mm_count.counter, 1, __ATOMIC_ACQ_REL) == 0) mmdrop_fn(mm);
+    if (__atomic_sub_fetch(&MM_COUNT(mm), 1, __ATOMIC_ACQ_REL) == 0) mmdrop_fn(mm);
 }
 /* control_lock held, no mmap/state lock across notifier registration. */
 static struct wu_context *get_context(struct mm_struct *mm)
@@ -307,9 +366,14 @@ static struct wu_context *get_context(struct mm_struct *mm)
     ctx = alloc_zero(sizeof(*ctx));
     if (!ctx) return NULL;
     INIT_LIST_HEAD(&ctx->pages); INIT_LIST_HEAD(&ctx->probes); INIT_LIST_HEAD(&ctx->shadows);
-    ctx->notifier.ops = &notifier_ops; ctx->mm = mm;
-    __atomic_add_fetch(&mm->mm_count.counter, 1, __ATOMIC_RELAXED);
-    if (notifier_register_fn(&ctx->notifier, mm)) { drop_mm(mm); free_fn(ctx); return NULL; }
+    ctx->notifier = alloc_zero(notifier_size);
+    if (!ctx->notifier) { free_fn(ctx); return NULL; }
+    WU_FIELD(void *, ctx->notifier, notifier_ops) = &notifier_ops_storage;
+    ctx->mm = mm;
+    __atomic_add_fetch(&MM_COUNT(mm), 1, __ATOMIC_RELAXED);
+    if (notifier_register_fn(ctx->notifier, mm)) {
+        drop_mm(mm); free_fn(ctx->notifier); free_fn(ctx); return NULL;
+    }
     lock_fn(&state_lock); link_tail(&ctx->node, &contexts); ++context_count; unlock_fn(&state_lock);
     return ctx;
 }
@@ -319,13 +383,13 @@ static bool valid_vma(struct vm_area_struct *vma, unsigned long address)
 #ifdef VM_ARM64_BTI
     unsupported |= VM_ARM64_BTI;
 #endif
-    return vma && vma->vm_start <= address && vma->vm_end - address >= 4 && vma->vm_file &&
-        S_ISREG(vma->vm_file->f_inode->i_mode) &&
-        (vma->vm_flags & (VM_READ | VM_EXEC)) == (VM_READ | VM_EXEC) && !(vma->vm_flags & unsupported);
+    return vma && VMA_START(vma) <= address && VMA_END(vma) - address >= 4 && VMA_FILE(vma) &&
+        S_ISREG(INODE_MODE(FILE_INODE(VMA_FILE(vma)))) &&
+        (VMA_FLAGS(vma) & (VM_READ | VM_EXEC)) == (VM_READ | VM_EXEC) && !(VMA_FLAGS(vma) & unsupported);
 }
 static void hold_file(struct file *file)
 {
-    __atomic_add_fetch(&file->f_count.counter, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&FILE_COUNT(file), 1, __ATOMIC_RELAXED);
 }
 static struct wu_shadow *make_shadow(struct wu_page *page, struct wu_probe *add, struct wu_probe *skip)
 {
@@ -366,19 +430,36 @@ static int publish_shadow(struct wu_page *page, struct wu_shadow *shadow)
 static bool consumer_filter(struct uprobe_consumer *consumer, enum uprobe_filter_ctx where,
                             struct mm_struct *mm)
 {
-    struct wu_probe *probe = container_of(consumer, struct wu_probe, consumer);
+    struct wu_context *ctx;
+    struct wu_probe *probe;
+    bool accept = false;
     /* A remap/new mapping is a new generation and requires explicit install.
      * Fork inherits the clean page after before_fork retires the parent. */
-    return where != UPROBE_FILTER_MMAP && mm == probe->context->mm &&
-           !READ_ONCE(probe->context->released) && READ_ONCE(probe->registered);
+    lock_fn(&state_lock);
+    list_for_each_entry(ctx, &contexts, node)
+        list_for_each_entry(probe, &ctx->probes, node)
+            if (probe->consumer == consumer) {
+                accept = where != UPROBE_FILTER_MMAP && mm == ctx->mm &&
+                         !ctx->released && probe->registered;
+                goto out;
+            }
+out:
+    unlock_fn(&state_lock);
+    return accept;
 }
 static int entry_handler(struct uprobe_consumer *consumer, struct pt_regs *regs)
 {
-    struct wu_probe *probe = container_of(consumer, struct wu_probe, consumer);
+    struct wu_context *ctx;
+    struct wu_probe *probe = NULL, *candidate;
     bool trace = false;
     unsigned int i;
     lock_fn(&state_lock);
-    if (current->mm == probe->context->mm && regs->pc == probe->info.address &&
+    list_for_each_entry(ctx, &contexts, node)
+        list_for_each_entry(candidate, &ctx->probes, node)
+            if (candidate->consumer == consumer) { probe = candidate; goto found; }
+found:
+    if (!probe) { unlock_fn(&state_lock); return 0; }
+    if (TASK_MM(current) == probe->context->mm && regs->pc == probe->info.address &&
         probe->info.state == WU_ACTIVE && probe->page->active) {
         for (i = 0; i < 31; ++i)
             if (probe->info.reg_mask & (1ULL << i)) regs->regs[i] = probe->info.regs[i];
@@ -387,7 +468,17 @@ static int entry_handler(struct uprobe_consumer *consumer, struct pt_regs *regs)
         trace = probe->info.flags & WU_F_TRACE;
     }
     unlock_fn(&state_lock);
-    if (trace && trace_fn)
+    if (trace && trace_puts_fn && format_fn) {
+        char message[256];
+        int length = format_fn(message, sizeof(message),
+                "+Test-Log+ wxuprobe fun_name:%s,offset:0x%llx,pc:0x%llx,x0:0x%llx\n",
+                probe->info.name, probe->info.offset, probe->info.address, regs->regs[0]);
+        /* __trace_puts copies the text into the ring buffer. Unlike
+         * __trace_printk it needs no loader-created per-CPU formatting buffer,
+         * so a KPM can use it without initializing or enabling global tracing. */
+        if (length >= sizeof(message)) length = sizeof(message) - 1;
+        if (length > 0) trace_puts_fn(0, message, length);
+    } else if (trace && trace_fn)
         trace_fn(0, "+Test-Log+ wxuprobe fun_name:%s,offset:0x%llx,pc:0x%llx,x0:0x%llx\n",
                  probe->info.name, probe->info.offset, probe->info.address, regs->regs[0]);
     return 0;
@@ -397,7 +488,7 @@ static int valid_registers(struct mm_struct *mm, const struct wu_request *reques
     if (request->reg_mask & ~WU_REG_MASK) return -EINVAL;
     if ((request->reg_mask & (1ULL << WU_REG_SP)) &&
         ((request->regs[WU_REG_SP] & 15) || !request->regs[WU_REG_SP] ||
-         request->regs[WU_REG_SP] >= mm->task_size)) return -EINVAL;
+         request->regs[WU_REG_SP] >= MM_TASK_SIZE(mm))) return -EINVAL;
     return 0;
 }
 static void fill_request(struct wu_request *request, struct wu_probe *probe)
@@ -425,10 +516,10 @@ static int install_probe(struct wu_context *ctx, struct wu_request *request, boo
     int rc;
     long got;
     if (!request->cookie || !request->address || (request->address & 3) ||
-        request->address >= ctx->mm->task_size) return -EINVAL;
+        request->address >= MM_TASK_SIZE(ctx->mm)) return -EINVAL;
     rc = valid_registers(ctx->mm, request);
     if (rc) return rc;
-    if ((request->flags & WU_F_TRACE) && !trace_fn) return -EOPNOTSUPP;
+    if ((request->flags & WU_F_TRACE) && !trace_supported()) return -EOPNOTSUPP;
     lock_fn(&state_lock);
     existing = find_cookie(ctx, request->cookie);
     if (existing) {
@@ -450,33 +541,35 @@ static int install_probe(struct wu_context *ctx, struct wu_request *request, boo
         (!page && retained_pages >= WU_MAX_PAGES)) return -ENOSPC;
     probe = alloc_zero(sizeof(*probe));
     if (!probe) return -ENOMEM;
-    read_lock_fn(&ctx->mm->mmap_lock);
+    probe->consumer = alloc_zero(consumer_size);
+    if (!probe->consumer) { free_fn(probe); return -ENOMEM; }
+    read_lock_fn(MM_LOCK(ctx->mm));
     vma = find_vma_fn(ctx->mm, request->address);
     if (!valid_vma(vma, request->address)) { rc = -EOPNOTSUPP; goto unlock_read; }
-    file = vma->vm_file; hold_file(file);
-    offset = ((loff_t)vma->vm_pgoff << PAGE_SHIFT) + request->address - vma->vm_start;
+    file = VMA_FILE(vma); hold_file(file);
+    offset = ((loff_t)VMA_OFFSET(vma) << PAGE_SHIFT) + request->address - VMA_START(vma);
     if ((request->offset != WU_OFFSET_AUTO && request->offset != offset) ||
-        (legacy && (!ctx->legacy_file || ctx->legacy_file->f_inode != file->f_inode))) {
+        (legacy && (!ctx->legacy_file || FILE_INODE(ctx->legacy_file) != FILE_INODE(file)))) {
         rc = -EINVAL; goto unlock_read;
     }
     if (!page) {
-        got = gup_fn(ctx->mm, request->address & PAGE_MASK, 1, 0, &pin, NULL, NULL);
+        got = gup6_fn ? gup6_fn(ctx->mm, request->address & PAGE_MASK, 1, 0, &pin, NULL) :
+              gup_fn(ctx->mm, request->address & PAGE_MASK, 1, 0, &pin, NULL, NULL);
         if (got != 1) { rc = got < 0 ? got : -EFAULT; goto unlock_read; }
-        if (PageCompound(pin)) { rc = -EOPNOTSUPP; goto unlock_read; }
     }
-    read_unlock_fn(&ctx->mm->mmap_lock);
+    read_unlock_fn(MM_LOCK(ctx->mm));
     if (!page) {
         page = alloc_zero(sizeof(*page));
         if (!page) { rc = -ENOMEM; goto fail; }
-        page->context = ctx; page->pin = pin; page->pfn = page_to_pfn(pin);
+        page->context = ctx; page->pin = pin;
         page->address = request->address & PAGE_MASK;
         fresh = true;
     }
-    write_lock_fn(&ctx->mm->mmap_lock);
+    write_lock_fn(MM_LOCK(ctx->mm));
     lock_fn(&state_lock);
     vma = find_vma_fn(ctx->mm, request->address);
-    if (ctx->released || !valid_vma(vma, request->address) || vma->vm_file != file ||
-        (((loff_t)vma->vm_pgoff << PAGE_SHIFT) + request->address - vma->vm_start) != offset) {
+    if (ctx->released || !valid_vma(vma, request->address) || VMA_FILE(vma) != file ||
+        (((loff_t)VMA_OFFSET(vma) << PAGE_SHIFT) + request->address - VMA_START(vma)) != offset) {
         rc = -ESTALE; goto unlock_write;
     }
     if (fresh) {
@@ -498,13 +591,14 @@ static int install_probe(struct wu_context *ctx, struct wu_request *request, boo
     request->offset = offset; request->state = WU_INSTALLING; request->last_error = 0;
     probe->info = *request; probe->context = ctx; probe->page = page; probe->file = file;
     probe->legacy = legacy; probe->registered = true;
-    probe->consumer.handler = entry_handler; probe->consumer.filter = consumer_filter;
+    WU_FIELD(void *, probe->consumer, consumer_handler) = entry_handler;
+    WU_FIELD(void *, probe->consumer, consumer_filter) = consumer_filter;
     if (fresh) { link_tail(&page->node, &ctx->pages); ++retained_pages; }
     link_tail(&probe->node, &ctx->probes); ++probe_count;
     operation = probe; operation_task = current;
-    unlock_fn(&state_lock); write_unlock_fn(&ctx->mm->mmap_lock);
-    rc = uprobe_register_fn(file->f_inode, offset, &probe->consumer);
-    write_lock_fn(&ctx->mm->mmap_lock);
+    unlock_fn(&state_lock); write_unlock_fn(MM_LOCK(ctx->mm));
+    rc = uprobe_register_fn(FILE_INODE(file), offset, probe->consumer);
+    write_lock_fn(MM_LOCK(ctx->mm));
     lock_fn(&state_lock);
     operation = NULL; operation_task = NULL;
     if (rc) {
@@ -517,23 +611,24 @@ static int install_probe(struct wu_context *ctx, struct wu_request *request, boo
         rc = -ESTALE;
     }
     fill_request(request, probe);
-    unlock_fn(&state_lock); write_unlock_fn(&ctx->mm->mmap_lock);
+    unlock_fn(&state_lock); write_unlock_fn(MM_LOCK(ctx->mm));
     if (rc && probe->registered) {
-        uprobe_unregister_fn(file->f_inode, offset, &probe->consumer);
+        uprobe_unregister_fn(FILE_INODE(file), offset, probe->consumer);
         lock_fn(&state_lock);
         probe->registered = false; probe->info.state = WU_REMOVED; probe->info.last_error = rc;
         fill_request(request, probe); unlock_fn(&state_lock);
     }
     return rc;
 unlock_write:
-    unlock_fn(&state_lock); write_unlock_fn(&ctx->mm->mmap_lock);
+    unlock_fn(&state_lock); write_unlock_fn(MM_LOCK(ctx->mm));
     if (fresh) free_fn(page);
     goto fail;
 unlock_read:
-    read_unlock_fn(&ctx->mm->mmap_lock);
+    read_unlock_fn(MM_LOCK(ctx->mm));
 fail:
     if (pin) release_pages_fn(&pin, 1);
     if (file) fput_fn(file);
+    free_fn(probe->consumer);
     free_fn(probe);
     return rc;
 }
@@ -547,14 +642,50 @@ int wu_linux_copy_insn(void *mapping, void *file, void *destination,
     lock_fn(&state_lock);
     probe = operation;
     if (probe && operation_task == current && probe->info.state == WU_INSTALLING &&
-        mapping == probe->file->f_inode->i_mapping && offset == probe->info.offset) {
+        mapping == INODE_MAPPING(FILE_INODE(probe->file)) && offset == probe->info.offset) {
         handled = 1; *result = -EOPNOTSUPP;
         if (size == 4) {
             copy_fn(destination, &probe->instruction, 4);
-            probe->arch = container_of(destination, struct arch_uprobe, insn);
+            probe->arch = (void *)((char *)destination - offsets.arch_insn);
             probe->copied = true; *result = 0;
         }
     }
+    unlock_fn(&state_lock);
+    return handled;
+}
+
+/* LTO may inline __copy_insn. The architecture decode entry remains available
+ * and is called under the uprobe consumer write lock, before COPY_INSN is set.
+ * Only a new, exclusively owned uprobe may receive the resident instruction.
+ * Existing decoded uprobes never reach this callback and remain rejected by
+ * the copied/arch checks in wu_linux_opcode. */
+int wu_linux_analyze(void *arch, void *mm, unsigned long address, long *result)
+{
+    struct wu_probe *probe;
+    void *uprobe;
+    int handled = 0;
+    if (!is_ready() || !host.copy_via_analyze || !dynamic_layout) return 0;
+    lock_fn(&state_lock);
+    probe = operation;
+    if (!probe || operation_task != current || probe->info.state != WU_INSTALLING) goto out;
+    uprobe = (char *)arch - offsets.uprobe_arch;
+    if (WU_FIELD(struct inode *, uprobe, uprobe_inode) != FILE_INODE(probe->file) ||
+        WU_FIELD(loff_t, uprobe, uprobe_offset) != probe->info.offset) goto out;
+    if (mm != probe->context->mm || address != probe->info.address ||
+        WU_FIELD(void *, uprobe, uprobe_consumers) != probe->consumer ||
+        WU_FIELD(void *, probe->consumer, consumer_next) ||
+        (WU_FIELD(unsigned long, uprobe, uprobe_flags) & 1UL)) {
+        handled = 1; *result = -EBUSY; goto out;
+    }
+    /* The generic trap test already examined the disk instruction, before
+     * this fallback runs. Apply that test to the resident replacement too. */
+    if (probe->instruction == UPROBE_SWBP_INSN) {
+        handled = 1; *result = -EOPNOTSUPP; goto out;
+    }
+    copy_fn((char *)arch + offsets.arch_insn, &probe->instruction, 4);
+    probe->arch = arch; probe->copied = true;
+    /* The original function still performs instruction rejection/decoding. */
+out:
     unlock_fn(&state_lock);
     return handled;
 }
@@ -590,7 +721,7 @@ found:
         if (operation != probe || operation_task != current || probe->context->mm != mm ||
             address != probe->info.address || !probe->copied || probe->arch != arch ||
             probe->info.state != WU_INSTALLING) { rc = -EBUSY; goto out; }
-        copy_fn(&instruction, arch->insn, 4);
+        copy_fn(&instruction, (char *)arch + offsets.arch_insn, 4);
         if (instruction != probe->instruction ||
             compare_fn(&instruction, (char *)from_pfn(page->pfn) + (address & ~PAGE_MASK), 4)) {
             rc = -ESTALE; goto out;
@@ -629,8 +760,8 @@ static int remove_probe(struct wu_probe *probe)
     int rc;
     if (!probe->registered) return 0;
     lock_fn(&state_lock); operation = probe; operation_task = current; unlock_fn(&state_lock);
-    uprobe_unregister_fn(probe->file->f_inode, probe->info.offset, &probe->consumer);
-    write_lock_fn(&probe->context->mm->mmap_lock);
+    uprobe_unregister_fn(FILE_INODE(probe->file), probe->info.offset, probe->consumer);
+    write_lock_fn(MM_LOCK(probe->context->mm));
     lock_fn(&state_lock);
     operation = NULL; operation_task = NULL;
     /* uprobe_unregister has a void result. If it did not remove our shadow
@@ -639,7 +770,7 @@ static int remove_probe(struct wu_probe *probe)
     rc = probe->info.last_error;
     if (rc == -ESTALE || rc == -ESRCH) rc = 0;
     probe->registered = false; probe->info.state = WU_REMOVED; probe->info.last_error = rc;
-    unlock_fn(&state_lock); write_unlock_fn(&probe->context->mm->mmap_lock);
+    unlock_fn(&state_lock); write_unlock_fn(MM_LOCK(probe->context->mm));
     return rc;
 }
 static int clear_context(struct wu_context *ctx)
@@ -665,17 +796,17 @@ static int quiesce(void)
     /* This synchronizes SRCU and may sleep. Called only from prctl, never
      * from KPM ctl0/exit, which the pinned KP loader invokes under RCU. */
     list_for_each_entry_safe(ctx, next, &contexts, node) {
-        notifier_unregister_fn(&ctx->notifier, ctx->mm);
+        notifier_unregister_fn(ctx->notifier, ctx->mm);
         lock_fn(&state_lock); unlink_node(&ctx->node); unlock_fn(&state_lock);
         list_for_each_entry_safe(probe, rnext, &ctx->probes, node) {
-            fput_fn(probe->file); free_fn(probe);
+            fput_fn(probe->file); free_fn(probe->consumer); free_fn(probe);
         }
         list_for_each_entry_safe(page, pnext, &ctx->pages, node) {
             release_pages_fn(&page->pin, 1); free_fn(page);
         }
         list_for_each_entry_safe(shadow, snext, &ctx->shadows, node) free_shadow(shadow);
         if (ctx->legacy_file) fput_fn(ctx->legacy_file);
-        drop_mm(ctx->mm); free_fn(ctx);
+        drop_mm(ctx->mm); free_fn(ctx->notifier); free_fn(ctx);
     }
     context_count = retained_pages = probe_count = shadow_count = 0;
     return 0;
@@ -685,7 +816,7 @@ static struct mm_struct *target_mm(int pid, int *error)
     struct mm_struct *mm = NULL;
     struct task_struct *task;
     if (pid < 0) { *error = -EINVAL; return NULL; }
-    if (!pid || pid == current->tgid) return get_mm_fn(current);
+    if (!pid || pid == TASK_TGID(current)) return get_mm_fn(current);
     if (!capable_fn(CAP_SYS_ADMIN)) { *error = -EPERM; return NULL; }
     rcu_lock_fn();
     task = find_task_fn(pid);
@@ -702,7 +833,7 @@ long wu_linux_request(int command, unsigned long user_request)
     struct mm_struct *mm = NULL;
     unsigned int i;
     int rc = 0;
-    if (!is_ready() || is_compat_task()) return -EOPNOTSUPP;
+    if (!is_ready() || compat_task()) return -EOPNOTSUPP;
     if (copy_user_buffer(&request, user_request, sizeof(request), false)) return -EFAULT;
     if (request.version != WXUPROBE_ABI_VERSION || request.size != sizeof(request) ||
         (request.flags & ~WU_F_TRACE)) return -EINVAL;
@@ -740,7 +871,7 @@ long wu_linux_request(int command, unsigned long user_request)
         if (command == PR_WXUPROBE_UPDATE) {
             rc = valid_registers(mm, &request);
             if (!rc && probe->info.state != WU_ACTIVE) rc = -ESTALE;
-            if (!rc && (request.flags & WU_F_TRACE) && !trace_fn) rc = -EOPNOTSUPP;
+            if (!rc && (request.flags & WU_F_TRACE) && !trace_supported()) rc = -EOPNOTSUPP;
             if (!rc) {
                 probe->info.reg_mask = request.reg_mask; probe->info.flags = request.flags;
                 copy_fn(probe->info.regs, request.regs, sizeof(request.regs));
@@ -768,9 +899,9 @@ int wu_linux_fault(unsigned long address, unsigned int esr, void *registers)
     int handled = 0, rc;
     if (!is_ready() || READ_ONCE(stopped) || !regs || !user_mode(regs) ||
         (ec != 0x20 && ec != 0x24) || (esr & 0x3c) != 0x0c) return 0;
-    mm = current->mm;
+    mm = TASK_MM(current);
     if (!mm) return 0;
-    read_lock_fn(&mm->mmap_lock);
+    read_lock_fn(MM_LOCK(mm));
     lock_fn(&state_lock); ctx = find_context(mm); page = ctx ? find_page(ctx, address) : NULL;
     if (page) {
         if (write) retire_page(page, -ESTALE);
@@ -780,7 +911,7 @@ int wu_linux_fault(unsigned long address, unsigned int esr, void *registers)
             else retire_page(page, rc);
         }
     }
-    unlock_fn(&state_lock); read_unlock_fn(&mm->mmap_lock);
+    unlock_fn(&state_lock); read_unlock_fn(MM_LOCK(mm));
     return handled;
 }
 int wu_linux_before_fork(void *mm_pointer)
@@ -795,20 +926,34 @@ int wu_linux_before_fork(void *mm_pointer)
      * through the original prevents publication into the fork copy gap. */
     lock_fn(&control_lock);
     if (stopped) { unlock_fn(&control_lock); return 0; }
-    write_lock_fn(&mm->mmap_lock);
+    write_lock_fn(MM_LOCK(mm));
     lock_fn(&state_lock); ctx = find_context(mm);
     if (ctx) list_for_each_entry(page, &ctx->pages, node) if (page->active) retire_page(page, -ESTALE);
-    unlock_fn(&state_lock); write_unlock_fn(&mm->mmap_lock);
+    unlock_fn(&state_lock); write_unlock_fn(MM_LOCK(mm));
     return 1;
 }
 void wu_linux_after_fork(void) { unlock_fn(&control_lock); }
+int wu_linux_before_current_fork(void)
+{
+    struct mm_struct *mm = TASK_MM(current);
+    if (!mm || !wu_linux_before_fork(mm)) return 0;
+    WRITE_ONCE(fork_owner, current);
+    return 1;
+}
+int wu_linux_after_current_fork(void)
+{
+    if (READ_ONCE(fork_owner) != current) return 0;
+    WRITE_ONCE(fork_owner, NULL);
+    wu_linux_after_fork();
+    return 1;
+}
 void wu_linux_before_gup(void *vma_pointer, unsigned long address)
 {
     struct vm_area_struct *vma = vma_pointer;
     struct wu_context *ctx;
     struct wu_page *page;
     if (!is_ready() || READ_ONCE(stopped) || !vma) return;
-    lock_fn(&state_lock); ctx = find_context(vma->vm_mm); page = ctx ? find_page(ctx, address) : NULL;
+    lock_fn(&state_lock); ctx = find_context(VMA_MM(vma)); page = ctx ? find_page(ctx, address) : NULL;
     if (page) retire_page(page, -ESTALE);
     unlock_fn(&state_lock);
 }
@@ -850,7 +995,7 @@ long wu_linux_legacy(int number, unsigned long user_request)
     char path[300], fix_path[300], name[150];
     unsigned long address;
     int rc = 0;
-    if (!is_ready() || is_compat_task()) return 1001;
+    if (!is_ready() || compat_task()) return 1001;
     /* Snapshot user input before taking locks; faults may retire source pages. */
     if (number == 0) {
         if (copy_user_buffer(&init, user_request, sizeof(init), false)) return 1001;
@@ -872,8 +1017,8 @@ long wu_linux_legacy(int number, unsigned long user_request)
     lock_fn(&state_lock); ctx = find_context(mm); unlock_fn(&state_lock);
     if (number == 2) { rc = clear_context(ctx); goto out; }
     if (number == 0) {
-        if (!init.base || init.base >= mm->task_size ||
-            init.uid != __kuid_val(current->cred->uid)) { rc = -EINVAL; goto out; }
+        if (!init.base || init.base >= MM_TASK_SIZE(mm) ||
+            init.uid != CRED_UID(TASK_CRED(current))) { rc = -EINVAL; goto out; }
         /* Live resident bytes replace Kernel-Trace's global read-cache hook.
          * The legacy fix_file pointer was validated above; no file is needed. */
         if (ctx) list_for_each_entry(probe, &ctx->probes, node)
@@ -890,7 +1035,7 @@ long wu_linux_legacy(int number, unsigned long user_request)
     zero_fn(&request, 0, sizeof(request));
     request.version = WXUPROBE_ABI_VERSION; request.size = sizeof(request); request.instance = instance;
     if (number == 1) {
-        if (item.function_offset > mm->task_size - ctx->legacy_base) { rc = -EINVAL; goto out; }
+        if (item.function_offset > MM_TASK_SIZE(mm) - ctx->legacy_base) { rc = -EINVAL; goto out; }
         request.address = ctx->legacy_base + item.function_offset;
         request.offset = item.offset; request.cookie = (1ULL << 63) | ++legacy_cookie;
         request.flags = WU_F_TRACE;
@@ -899,7 +1044,7 @@ long wu_linux_legacy(int number, unsigned long user_request)
         rc = install_probe(ctx, &request, true);
         goto out;
     }
-    if (registers.function_offset > mm->task_size - ctx->legacy_base) { rc = -EINVAL; goto out; }
+    if (registers.function_offset > MM_TASK_SIZE(mm) - ctx->legacy_base) { rc = -EINVAL; goto out; }
     address = ctx->legacy_base + registers.function_offset;
     lock_fn(&state_lock);
     list_for_each_entry(probe, &ctx->probes, node)
@@ -925,18 +1070,186 @@ unlock:
     field = (void *)host.lookup(name); \
     if (!field) { if (message_fn) message_fn("\0013wxuprobe: missing %s\n", name); return -EOPNOTSUPP; } \
 } while (0)
-int wu_linux_init(const struct wu_host *new_host)
+
+/* The fallback keeps the original exact-kernel contract for kernels built
+ * without BTF. A present but incompatible BTF is always an error. */
+static int native_layout(void)
 {
     const char expected[] = "Linux version " UTS_RELEASE " ";
-    const char *banner;
-    u64 (*random_fn)(void);
-    host = *new_host;
-    message_fn = (void *)host.lookup("printk");
-    RESOLVE(compare_fn, "memcmp"); RESOLVE(copy_fn, "memcpy"); RESOLVE(zero_fn, "memset");
-    banner = (const char *)host.lookup("linux_banner");
+    const char *banner = (const char *)host.lookup("linux_banner");
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+    /* KPM storage is outside Linux's static/module key registration. */
+    return -EOPNOTSUPP;
+#endif
+    if (host.copy_via_analyze) return -EOPNOTSUPP;
     if (!banner || compare_fn(banner, expected, sizeof(expected) - 1) ||
         host.mm_pgd_offset != offsetof(struct mm_struct, pgd)) return -EPROTO;
-    RESOLVE(wu_memstart_addr, "memstart_addr");
+#define NATIVE(field, type, member) offsets.field = offsetof(struct type, member)
+    NATIVE(mm_pgd, mm_struct, pgd); NATIVE(mm_lock, mm_struct, mmap_lock);
+    NATIVE(mm_count, mm_struct, mm_count); NATIVE(mm_task_size, mm_struct, task_size);
+    NATIVE(task_mm, task_struct, mm); NATIVE(task_tgid, task_struct, tgid);
+    NATIVE(task_cred, task_struct, cred); NATIVE(cred_uid, cred, uid);
+    offsets.task_flags = offsetof(struct task_struct, thread_info) + offsetof(struct thread_info, flags);
+    NATIVE(vma_start, vm_area_struct, vm_start); NATIVE(vma_end, vm_area_struct, vm_end);
+    NATIVE(vma_flags, vm_area_struct, vm_flags); NATIVE(vma_file, vm_area_struct, vm_file);
+    NATIVE(vma_offset, vm_area_struct, vm_pgoff); NATIVE(vma_mm, vm_area_struct, vm_mm);
+    NATIVE(file_inode, file, f_inode); NATIVE(file_count, file, f_count);
+    NATIVE(inode_mode, inode, i_mode); NATIVE(inode_mapping, inode, i_mapping);
+    NATIVE(notifier_ops, mmu_notifier, ops);
+    NATIVE(range_start, mmu_notifier_range, start); NATIVE(range_end, mmu_notifier_range, end);
+    NATIVE(range_flags, mmu_notifier_range, flags);
+    NATIVE(ops_release, mmu_notifier_ops, release);
+    NATIVE(ops_invalidate, mmu_notifier_ops, invalidate_range_start);
+    NATIVE(consumer_handler, uprobe_consumer, handler);
+    NATIVE(consumer_filter, uprobe_consumer, filter); NATIVE(consumer_next, uprobe_consumer, next);
+    NATIVE(arch_insn, arch_uprobe, insn);
+#undef NATIVE
+    notifier_size = sizeof(struct mmu_notifier); consumer_size = sizeof(struct uprobe_consumer);
+    if (sizeof(struct mutex) > WU_OPAQUE_MAX || sizeof(struct mmu_notifier_ops) > WU_OPAQUE_MAX)
+        return -EOPNOTSUPP;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+    gup6_fn = (void *)gup_fn; gup_fn = NULL;
+#endif
+    return 0;
+}
+
+static int target_layout(void)
+{
+    unsigned int mutex_size, ops_size, sem_size, thread_size, thread_offset, flags_offset;
+    unsigned int offset, map_size, arch_size;
+    int rc, nargs;
+    rc = wx_btf_init(&btf, host.lookup, (void *)alloc_fn, (void *)free_fn, GFP_KERNEL);
+    if (rc == -ENOENT && !host.lookup("__start_BTF") && !host.lookup("__stop_BTF"))
+        return native_layout();
+    if (rc) return rc;
+#define SIZE(type, destination) do { \
+    rc = wx_btf_size(&btf, #type, &(destination)); if (rc) goto out; \
+} while (0)
+#define MEMBER(field, type, member, bytes) do { \
+    rc = wx_btf_member(&btf, #type, #member, bytes, &offsets.field); \
+    if (rc) { if (message_fn) message_fn("\0013wxuprobe: incompatible BTF %s.%s: %d\n", #type, #member, rc); goto out; } \
+} while (0)
+    SIZE(mutex, mutex_size); SIZE(mmu_notifier_ops, ops_size); SIZE(rw_semaphore, sem_size);
+    SIZE(mmu_notifier, notifier_size); SIZE(uprobe_consumer, consumer_size);
+    SIZE(thread_info, thread_size);
+    /* PREEMPT_RT replaces the ordinary mutex implementation. Its locking
+     * semantics have not been audited for these callbacks. */
+    rc = wx_btf_member(&btf, "mutex", "owner", 8, &offset);
+    if (rc) goto out;
+    rc = wx_btf_member(&btf, "mutex", "wait_list", 16, &offset);
+    if (rc) goto out;
+    rc = wx_btf_size(&btf, "lockdep_map", &map_size);
+    if (rc && rc != -ENOENT) goto out;
+    if (!rc && map_size) {
+        rc = wx_btf_member(&btf, "mutex", "dep_map", map_size, &offset);
+        if (!rc) { rc = -EOPNOTSUPP; goto out; }
+        if (rc != -ENOENT) goto out;
+    }
+    if (!mutex_size || mutex_size > WU_OPAQUE_MAX || !ops_size || ops_size > WU_OPAQUE_MAX ||
+        !notifier_size || notifier_size > WU_OPAQUE_MAX || !consumer_size || consumer_size > WU_OPAQUE_MAX) {
+        rc = -EOPNOTSUPP; goto out;
+    }
+    MEMBER(mm_pgd, mm_struct, pgd, 8); MEMBER(mm_lock, mm_struct, mmap_lock, sem_size);
+    MEMBER(mm_count, mm_struct, mm_count, 4); MEMBER(mm_task_size, mm_struct, task_size, 8);
+    MEMBER(task_mm, task_struct, mm, 8); MEMBER(task_tgid, task_struct, tgid, 4);
+    MEMBER(task_cred, task_struct, cred, 8); MEMBER(cred_uid, cred, uid, 4);
+    rc = wx_btf_member(&btf, "task_struct", "thread_info", thread_size, &thread_offset);
+    if (rc) goto out;
+    rc = wx_btf_member(&btf, "thread_info", "flags", 8, &flags_offset);
+    if (rc) goto out;
+    offsets.task_flags = thread_offset + flags_offset;
+    MEMBER(vma_start, vm_area_struct, vm_start, 8); MEMBER(vma_end, vm_area_struct, vm_end, 8);
+    MEMBER(vma_flags, vm_area_struct, vm_flags, 8); MEMBER(vma_file, vm_area_struct, vm_file, 8);
+    MEMBER(vma_offset, vm_area_struct, vm_pgoff, 8); MEMBER(vma_mm, vm_area_struct, vm_mm, 8);
+    MEMBER(file_inode, file, f_inode, 8); MEMBER(file_count, file, f_count, 8);
+    MEMBER(inode_mode, inode, i_mode, 2); MEMBER(inode_mapping, inode, i_mapping, 8);
+    MEMBER(notifier_ops, mmu_notifier, ops, 8);
+    MEMBER(range_start, mmu_notifier_range, start, 8); MEMBER(range_end, mmu_notifier_range, end, 8);
+    MEMBER(range_flags, mmu_notifier_range, flags, 4);
+    MEMBER(ops_release, mmu_notifier_ops, release, 8);
+    MEMBER(ops_invalidate, mmu_notifier_ops, invalidate_range_start, 8);
+    MEMBER(consumer_handler, uprobe_consumer, handler, 8);
+    MEMBER(consumer_filter, uprobe_consumer, filter, 8); MEMBER(consumer_next, uprobe_consumer, next, 8);
+    MEMBER(arch_insn, arch_uprobe, insn, 4);
+    if (host.copy_via_analyze) {
+        SIZE(arch_uprobe, arch_size);
+        MEMBER(uprobe_arch, uprobe, arch, arch_size);
+        MEMBER(uprobe_inode, uprobe, inode, 8); MEMBER(uprobe_offset, uprobe, offset, 8);
+        MEMBER(uprobe_consumers, uprobe, consumers, 8); MEMBER(uprobe_flags, uprobe, flags, 8);
+    }
+    /* pt_regs is accessed by the architecture's register helpers; prove its
+     * used members retain the layout with which this translation unit built. */
+#define REGS(member, bytes) do { \
+    rc = wx_btf_member(&btf, "pt_regs", #member, bytes, &offset); \
+    if (rc || offset != offsetof(struct pt_regs, member)) { rc = -EPROTO; goto out; } \
+} while (0)
+    REGS(regs, 31 * 8); REGS(sp, 8); REGS(pc, 8); REGS(pstate, 8);
+#undef REGS
+    if (offsets.mm_pgd != host.mm_pgd_offset) { rc = -EPROTO; goto out; }
+#define ARITY(name, expected) do { \
+    if (wx_btf_func_arity(&btf, name) != expected) { \
+        if (message_fn) message_fn("\0013wxuprobe: incompatible BTF prototype %s\n", name); \
+        rc = -EPROTO; goto out; \
+    } \
+} while (0)
+#define PARAM(name, index, type) do { \
+    rc = wx_btf_func_param_named(&btf, name, index, #type); if (rc) goto out; \
+} while (0)
+    /* Some compilers omit BTF FUNC records for these static functions while
+     * retaining their callable kallsyms symbols. Their signatures have been
+     * audited across the bounded supported kernel range. Existing records
+     * must still match; malformed BTF never selects this exception. */
+    nargs = wx_btf_func_arity(&btf, "__copy_insn");
+    if (nargs != -ENOENT) {
+        ARITY("__copy_insn", 5); PARAM("__copy_insn", 0, address_space); PARAM("__copy_insn", 1, file);
+    }
+    if (host.copy_via_analyze) {
+        ARITY("arch_uprobe_analyze_insn", 3);
+        PARAM("arch_uprobe_analyze_insn", 0, arch_uprobe);
+        PARAM("arch_uprobe_analyze_insn", 1, mm_struct);
+    }
+    ARITY("uprobe_write_opcode", 4); PARAM("uprobe_write_opcode", 0, arch_uprobe);
+    PARAM("uprobe_write_opcode", 1, mm_struct);
+    ARITY("uprobe_register", 3); PARAM("uprobe_register", 0, inode); PARAM("uprobe_register", 2, uprobe_consumer);
+    ARITY("uprobe_unregister", 3); PARAM("uprobe_unregister", 2, uprobe_consumer);
+    ARITY("do_page_fault", 3);
+    nargs = wx_btf_func_arity(&btf, "dup_mmap");
+    if (nargs != -ENOENT) { ARITY("dup_mmap", 2); PARAM("dup_mmap", 1, mm_struct); }
+    if (host.fork_uprobe_pair) {
+        ARITY("uprobe_start_dup_mmap", 0); ARITY("uprobe_end_dup_mmap", 0);
+    }
+    ARITY("follow_page_pte", 5); PARAM("follow_page_pte", 0, vm_area_struct);
+    ARITY("vm_normal_page", 3); ARITY("apply_to_existing_page_range", 5);
+    ARITY("mmu_notifier_register", 2); ARITY("mmu_notifier_unregister", 2);
+    ARITY("__mutex_init", 3); ARITY("release_pages", 2);
+    nargs = wx_btf_func_arity(&btf, "get_user_pages_remote");
+    PARAM("get_user_pages_remote", 0, mm_struct);
+    if (nargs == 6) { gup6_fn = (void *)gup_fn; gup_fn = NULL; }
+    else if (nargs != 7) { rc = -EPROTO; goto out; }
+    dynamic_layout = true;
+    rc = 0;
+out:
+    wx_btf_destroy(&btf);
+    return rc;
+#undef PARAM
+#undef ARITY
+#undef MEMBER
+#undef SIZE
+}
+
+int wu_linux_init(const struct wu_host *new_host)
+{
+    u64 (*random_fn)(void);
+    void (*mutex_init_fn)(void *, const char *, void *);
+    int rc;
+    host = *new_host;
+    if (!host.from_pfn || !host.to_pfn || host.page_shift != PAGE_SHIFT ||
+        host.page_levels < 3 || host.page_levels > 4 ||
+        host.kernel_version < KERNEL_VERSION(5, 10, 0) ||
+        host.kernel_version >= KERNEL_VERSION(6, 7, 0)) return -EOPNOTSUPP;
+    message_fn = (void *)host.lookup("printk");
+    if (!message_fn) message_fn = (void *)host.lookup("_printk");
+    RESOLVE(compare_fn, "memcmp"); RESOLVE(copy_fn, "memcpy"); RESOLVE(zero_fn, "memset");
     RESOLVE(alloc_fn, "__kmalloc"); RESOLVE(free_fn, "kfree");
     RESOLVE(alloc_pages_fn, "__get_free_pages"); RESOLVE(free_pages_fn, "free_pages");
     RESOLVE(lock_fn, "mutex_lock"); RESOLVE(unlock_fn, "mutex_unlock");
@@ -946,14 +1259,28 @@ int wu_linux_init(const struct wu_host *new_host)
     RESOLVE(find_task_fn, "find_task_by_vpid"); RESOLVE(rcu_lock_fn, "__rcu_read_lock"); RESOLVE(rcu_unlock_fn, "__rcu_read_unlock");
     RESOLVE(capable_fn, "capable"); RESOLVE(find_vma_fn, "find_vma");
     RESOLVE(gup_fn, "get_user_pages_remote"); RESOLVE(release_pages_fn, "release_pages");
+    RESOLVE(normal_page_fn, "vm_normal_page"); RESOLVE(mutex_init_fn, "__mutex_init");
     RESOLVE(walk_fn, "apply_to_existing_page_range");
     RESOLVE(notifier_register_fn, "mmu_notifier_register"); RESOLVE(notifier_unregister_fn, "mmu_notifier_unregister");
     RESOLVE(uprobe_register_fn, "uprobe_register"); RESOLVE(uprobe_unregister_fn, "uprobe_unregister");
     RESOLVE(access_vm_fn, "access_process_vm");
     RESOLVE(open_fn, "filp_open"); RESOLVE(fput_fn, "fput");
+    rc = target_layout();
+    if (rc) return rc;
+    WU_FIELD(void *, &notifier_ops_storage, ops_release) = mm_release;
+    WU_FIELD(void *, &notifier_ops_storage, ops_invalidate) = invalidate_start;
+    mutex_init_fn(control_mutex, "wxuprobe.control", &control_key);
+    mutex_init_fn(state_mutex, "wxuprobe.state", &state_key);
     RESOLVE(random_fn, "get_random_u64"); instance = random_fn();
     if (!instance) return -EIO;
     trace_fn = (void *)host.lookup("__trace_printk");
+    trace_puts_fn = (void *)host.lookup("__trace_puts");
+    format_fn = (void *)host.lookup("scnprintf");
+    if (!format_fn) format_fn = (void *)host.lookup("snprintf");
+    if (message_fn) message_fn("\0016wxuprobe: %s kernel layout, GUP %u arguments\n",
+                              dynamic_layout ? "BTF" : "exact", gup6_fn ? 6 : 7);
+    if (message_fn && host.copy_via_analyze)
+        message_fn("\0016wxuprobe: resident instruction supplied before architecture decode (LTO fallback)\n");
     return 0;
 }
 void wu_linux_start(void)
